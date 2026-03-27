@@ -1,0 +1,42 @@
+camera:
+  source:
+    device_id: 0
+    width: 1280
+    height: 720
+    fps: 30
+  intrinsics:
+    camera_matrix:
+      - [800.0, 0.0, 640.0]
+      - [0.0, 800.0, 360.0]
+      - [0.0, 0.0, 1.0]
+    dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+display:
+  enabled: true
+  window_name: aruco_detection
+
+aruco:
+  dictionary: DICT_5X5_50
+  marker_length_m: 010
+  detector:
+    adaptiveThreshWinSizeMin: 3
+    adaptiveThreshWinSizeMax: 23
+    adaptiveThreshWinSizeStep: 10
+    cornerRefinementMethod: SUBPIX
+
+target_frame:
+  name: robot_base
+  rotation_matrix:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  translation_m: [0.0, 0.0, 0.0]
+
+tracking:
+  target_id: 0
+  history_size: 10
+  max_prediction_duration_s: 1.0
+
+logging:
+  output_json: tracking_log.json
+  flush_every_frame: true
