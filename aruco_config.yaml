@@ -1,9 +1,18 @@
-camera:
-  source:
+input:
+  type: camera
+  camera:
     device_id: 0
     width: 1280
     height: 720
     fps: 30
+  rosbag:
+    bag_path: demo.bag
+    topic: /camera/image_raw
+    start_time_s: 0.0
+    end_time_s: null
+    loop: false
+
+camera:
   intrinsics:
     camera_matrix:
       - [800.0, 0.0, 640.0]
@@ -12,12 +21,18 @@ camera:
     dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
 
 display:
-  enabled: true
+  enabled: false
   window_name: aruco_detection
+
+video:
+  save_enabled: false
+  output_path: tracking_output.mp4
+  fps: 30
+  fourcc: mp4v
 
 aruco:
   dictionary: DICT_5X5_50
-  marker_length_m: 010
+  marker_length_m: 0.10
   detector:
     adaptiveThreshWinSizeMin: 3
     adaptiveThreshWinSizeMax: 23
