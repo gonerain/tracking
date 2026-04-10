@@ -1,2 +1,7 @@
 __pycache__/
 *.json
+.codex
+outputs/*
+
+data/geo_scan2/*
+data/span/*

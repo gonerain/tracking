@@ -1,24 +1,19 @@
-# ArUco Tracking
+# Tracking Tools
 
-基于 OpenCV ArUco 的检测与跟踪工具，支持相机输入和 ROS1 rosbag 输入。
+## 目录
 
-## 功能
-
-- 检测 ArUco marker
-- 输出 marker 在相机坐标系下的位置
-- 将点转换到目标坐标系
-- 指定单个 marker id 持续跟踪
-- 目标短暂消失时做短时匀速预测
-- 将时间戳、位置和框信息保存为 JSON
-- 保存带检测框和预测框的输出视频
-
-## 文件
-
-- `aruco_config.yaml`：配置文件
-- `geometry.py`：坐标变换和投影函数
-- `detect_aruco.py`：检测脚本
-- `tracking.py`：跟踪脚本
-- `requirements.txt`：Python 依赖
+- `core/detect_aruco.py`：ArUco 检测核心逻辑
+- `core/tracking.py`：ArUco 跟踪核心逻辑
+- `core/lidar_tracking.py`：Livox 点云人体聚类与跟踪核心逻辑
+- `core/segmentation.py`：前视图语义/实例/全景分割统一入口
+- `core/geometry.py`：几何与坐标变换
+- `tools/detect_aruco.py`：ArUco 检测入口
+- `tools/tracking.py`：ArUco 跟踪入口
+- `tools/lidar_tracking.py`：雷达人体聚类入口
+- `tools/segment_image.py`：单张图片分割预览入口
+- `configs/aruco_config.yaml`：相机 ArUco 配置
+- `configs/lidar_config.yaml`：雷达聚类与跟踪配置
+- `outputs/`：默认日志和视频输出目录
 
 ## 安装
 
@@ -26,141 +21,108 @@
 pip install -r requirements.txt
 ```
 
-`requirements.txt` 只包含当前工程的 Python 依赖。`rosbag` 不通过 pip 安装，使用 rosbag 输入时需要你本地已有 ROS1 Python 环境。
-
-## 配置
-
-### 输入源
-
-```yaml
-input:
-  type: camera
-  camera:
-    device_id: 0
-    width: 1280
-    height: 720
-    fps: 30
-  rosbag:
-    bag_path: demo.bag
-    topic: /camera/image_raw
-    start_time_s: 0.0
-    end_time_s: null
-    loop: false
-```
-
 说明：
 
-- `input.type`：`camera` 或 `rosbag`
-- `input.rosbag.topic`：图像话题名
-- `input.rosbag.start_time_s` / `end_time_s`：按 bag 内时间截取
-- `input.rosbag.loop`：读完后是否循环
-
-当前 rosbag 支持：
-
-- `sensor_msgs/Image`：`bgr8`、`rgb8`、`mono8`
-- `sensor_msgs/CompressedImage`
-
-### 相机内参
-
-```yaml
-camera:
-  intrinsics:
-    camera_matrix:
-      - [800.0, 0.0, 640.0]
-      - [0.0, 800.0, 360.0]
-      - [0.0, 0.0, 1.0]
-    dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
-```
-
-### 目标坐标系
-
-```yaml
-target_frame:
-  name: robot_base
-  rotation_matrix:
-    - [1.0, 0.0, 0.0]
-    - [0.0, 1.0, 0.0]
-    - [0.0, 0.0, 1.0]
-  translation_m: [0.0, 0.0, 0.0]
-```
-
-### 跟踪
-
-```yaml
-tracking:
-  target_id: 0
-  history_size: 10
-  max_prediction_duration_s: 1.0
-```
-
-### 视频保存
-
-```yaml
-video:
-  save_enabled: false
-  output_path: tracking_output.mp4
-  fps: 30
-  fourcc: mp4v
-```
-
-### JSON 日志
-
-```yaml
-logging:
-  output_json: tracking_log.json
-  flush_every_frame: true
-```
+- ROS1 `.bag` 读取依赖 `rosbag`
+- `rosbag` 不通过 `pip` 安装
+- 读取 `data/geo_scan2/*.bag` 时，需要 ROS1 Python 环境或 Noetic 容器
 
 ## 运行
 
-检测：
+推荐从仓库根目录运行：
 
 ```bash
-python3 detect_aruco.py --config aruco_config.yaml
+python3 tools/detect_aruco.py
+python3 tools/tracking.py
+python3 tools/lidar_tracking.py
+python3 tools/segment_image.py --image path/to/front.png
 ```
 
-跟踪：
+或者直接用仓库根目录统一入口：
 
 ```bash
-python3 tracking.py --config aruco_config.yaml
+python3 main.py detect_aruco
+python3 main.py tracking
+python3 main.py lidar_tracking
+python3 main.py segment_image --image path/to/front.png
+python3 main.py fusion_tracking
 ```
 
-如果要从 rosbag 读取，把配置改成：
+融合入口会读取相机 ArUco 与 Livox 点云，两者按时间戳顺序推进，用 ArUco 在 lidar 坐标系下的目标位置给激光聚类提供先验：
 
-```yaml
-input:
-  type: rosbag
+```bash
+python3 main.py fusion_tracking --aruco-config configs/aruco_config.yaml --lidar-config configs/lidar_config.yaml
 ```
 
-## 跟踪状态
+显式指定配置：
 
-`tracking.py` 只跟踪 `tracking.target_id`。
+```bash
+python3 tools/detect_aruco.py --config configs/aruco_config.yaml
+python3 tools/tracking.py --config configs/aruco_config.yaml
+python3 tools/lidar_tracking.py --config configs/lidar_config.yaml
+python3 tools/segment_image.py --config configs/lidar_config.yaml --image path/to/front.png --output outputs/segmentation_preview.png
+```
 
-- `observed`：当前帧检测到了目标
-- `predicted`：当前帧没检测到，但还在允许预测时长内
-- `lost`：超过最大预测时长，停止预测
+## Docker
 
-显示或视频保存打开时：
+启动 Noetic 容器：
 
-- 真实检测框按检测结果绘制
-- 预测状态会绘制预测框和预测中心点
+```bash
+bash docker/start.sh
+```
 
-## 输出 JSON
+脚本会进入 `rospytorch` 容器，并把仓库挂载到：
 
-每条记录包含：
+```bash
+/root/HDMap/tracking
+```
 
-- `timestamp`
-- `datetime`
-- `target_id`
-- `visible`
-- `tracking_state`
-- `position_camera_m`
-- `position_target_m`
-- `corners_px`
+我已经在这个容器里验证过：
 
-## 备注
+- `rosbag` 可导入
+- `tools/lidar_tracking.py` 可以读取 `data/geo_scan2/data_0.bag`
 
-- 运行前需要把相机内参改成你的真实标定值
-- rosbag 模式下时间戳优先使用 bag 消息时间
-- 如果 `cv2.imshow()` 的 Qt 后端有问题，可以把 `display.enabled` 设为 `false`
-- 当前预测模型是简单匀速外推，只适合短时间遮挡
+## 当前雷达脚本
+
+`core/lidar_tracking.py` 当前流程：
+
+- ROI 裁剪
+- 车体自遮挡剔除
+- 简单地面去除
+- 欧式聚类
+- 基于尺寸和点数的人体候选筛选
+- 简化常速度跟踪
+
+输出 JSON 会包含：
+
+- 原始点数和过滤后点数
+- 候选簇列表
+- `centroid_lidar_m`
+- 更稳的 `footpoint_lidar_m`
+- `track.position_lidar_m`
+
+另外默认会输出雷达 debug 图到 `outputs/lidar_debug/`：
+
+- `raw_bev/`：原始点云俯视图
+- `filtered_bev/`：过滤后点云俯视图，带候选簇和跟踪点
+- `side_view/`：`x-z` 侧视图，方便看高度和地面去除
+- `target_crop/`：围绕当前跟踪目标的局部俯视图
+- `segmentation/`：前视分割预览
+- `overview/`：front 图、分割图和 lidar 视图拼在一起的总览图
+
+图例：
+
+- 灰色点：点云
+- 橙色框：候选簇包围盒
+- 蓝点：簇中心
+- 红点：脚点估计
+- 绿色或黄色圆点：最终跟踪位置
+
+如果图片太多，可以调 `configs/lidar_config.yaml` 里的 `debug.every_n_frames`。
+
+当前结果已经能在部分时间段稳定抓到人形簇，但仍有误检。下一步主要靠调 `configs/lidar_config.yaml` 的：
+
+- `roi`
+- `ground_removal`
+- `person_cluster`
+- `tracker.gating_distance_m`

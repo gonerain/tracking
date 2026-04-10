@@ -1,0 +1,76 @@
+input:
+  rosbag:
+    bag_path: data/geo_scan2/data_0.bag
+    topic: /lidar
+    start_time_s: null
+    end_time_s: null
+    loop: false
+
+roi:
+  shape: circle
+  center_xy_m: [0.0, 0.0]
+  min_radius_m: 0.5
+  radius_m: 10.0
+  z: [-1.5, 3.0]
+
+ego_vehicle_filter:
+  enabled: true
+  x: [-2.5, 1.5]
+  y: [-1.2, 1.2]
+  z: [-2.0, 2.0]
+
+ground_removal:
+  method: z_threshold
+  z_min: 0.2
+  z_max: 3.0
+
+clustering:
+  tolerance_m: 0.45
+  min_cluster_points: 8
+  max_cluster_points: 5000
+
+person_cluster:
+  min_points: 6
+  height_m: [0.5, 2.6]
+  width_m: [0.10, 1.8]
+  depth_m: [0.08, 1.8]
+  height_preferred_m: 1.6
+  width_preferred_m: 0.7
+  depth_preferred_m: 0.6
+  point_count_preferred: 80
+
+tracker:
+  gating_distance_m: 1.2
+  max_prediction_duration_s: 0.6
+  process_gain: 0.65
+
+logging:
+  output_json: outputs/lidar_tracking_log.json
+  print_summary_every_frame: true
+  flush_every_frame: true
+
+sync:
+  camera_sync_max_dt_s: 0.08
+
+segmentation:
+  enabled: true
+  predictor_kind: detectron
+  config_path: imseg/mask2former/config/swin/maskformer2_swin_large_IN21k_384_bs16_300k.yaml
+  model_path: imseg/mask2former/model/model.pkl
+  person_class_id: 19
+  camera_config: configs/aruco_config.yaml
+
+debug:
+  save_images: true
+  output_dir: outputs/lidar_debug
+  every_n_frames: 5
+  image_width: 1200
+  image_height: 900
+  point_radius_px: 2
+  save_raw_bev: true
+  save_filtered_bev: true
+  save_side_view: true
+  save_target_crop: true
+  save_overview: true
+  target_crop_half_width_m: 2.5
+  target_crop_half_height_m: 2.5

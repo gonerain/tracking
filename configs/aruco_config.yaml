@@ -1,0 +1,58 @@
+input:
+  type: rosbag
+  camera:
+    device_id: 0
+    width: 1280
+    height: 1024
+    fps: 10
+  rosbag:
+    bag_path: data/geo_scan2/data_0.bag
+    topic: /front_camera/image/compressed
+    start_time_s: 0.0
+    end_time_s: null
+    loop: false
+
+camera:
+  intrinsics:
+    camera_model: equidistant
+    camera_matrix:
+      - [464.8906509662917, 0.0, 631.6777733624097]
+      - [0.0, 465.0582538242402, 523.4363256680425]
+      - [0.0, 0.0, 1.0]
+    dist_coeffs: [-0.017366953282639, 0.000574174219028, -0.00154438708609, 0.000549409825028]
+
+display:
+  enabled: false
+  window_name: aruco_detection
+
+video:
+  save_enabled: false
+  output_path: outputs/tracking_output.mp4
+  fps: 30
+  fourcc: mp4v
+
+aruco:
+  dictionary: DICT_5X5_50
+  marker_length_m: 0.10
+  detector:
+    adaptiveThreshWinSizeMin: 3
+    adaptiveThreshWinSizeMax: 23
+    adaptiveThreshWinSizeStep: 10
+    cornerRefinementMethod: SUBPIX
+
+target_frame:
+  name: lidar
+  rotation_matrix:
+    - [-0.0248760658442102, 0.4141228407617354, 0.9098810109610734]
+    - [-0.9996892397064623, -0.008835361707340894, -0.0233100922052239]
+    - [-0.001614113759963343, -0.9101781194595544, 0.4142139368657687]
+  translation_m: [0.051401176491, 0.015593452288, -0.06077996213]
+
+tracking:
+  target_id: 0
+  history_size: 10
+  max_prediction_duration_s: 1.0
+
+logging:
+  output_json: outputs/tracking_log.json
+  flush_every_frame: true
