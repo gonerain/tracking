@@ -15,7 +15,7 @@ import numpy as np
 import yaml
 
 from core.geometry import project_camera_point_to_image
-from core.segmentation import SegmentationPredictor, extract_person_mask, visualize_panoptic, visualize_semantic
+from core.segmentation import INSTANCE_PALETTE, SegmentationPredictor, extract_person_mask, extract_person_masks, select_relevant_person_masks, visualize_instance, visualize_panoptic, visualize_semantic
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -323,8 +323,10 @@ def overlay_person_mask(frame: np.ndarray, mask: np.ndarray | None) -> np.ndarra
 
 def render_segmentation_preview(
     frame: np.ndarray | None,
-    segmentation: np.ndarray | None,
+    segmentation: Any,
     person_mask: np.ndarray | None,
+    selected_person_masks: list[np.ndarray] | None,
+    raw_person_mask_count: int,
     frame_index: int,
     timestamp: float,
     camera_timestamp: float | None,
@@ -342,7 +344,16 @@ def render_segmentation_preview(
         return canvas
 
     canvas = cv2.resize(frame, (canvas_width, canvas_height), interpolation=cv2.INTER_LINEAR)
-    if segmentation is not None:
+    if selected_person_masks:
+        for group_index, mask in enumerate(selected_person_masks):
+            mask_resized = cv2.resize(mask.astype(np.uint8), (canvas_width, canvas_height), interpolation=cv2.INTER_NEAREST) > 0
+            color = tuple(int(v) for v in INSTANCE_PALETTE[group_index % len(INSTANCE_PALETTE)])
+            overlay = canvas.copy()
+            overlay[mask_resized] = color
+            cv2.addWeighted(overlay, 0.45, canvas, 0.55, 0, canvas)
+            contours, _ = cv2.findContours(mask_resized.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(canvas, contours, -1, color, 2)
+    elif segmentation is not None:
         if isinstance(segmentation, dict):
             if "panoptic_seg" in segmentation:
                 canvas = cv2.resize(
@@ -351,15 +362,11 @@ def render_segmentation_preview(
                     interpolation=cv2.INTER_LINEAR,
                 )
             elif "pred_masks" in segmentation:
-                overlay = canvas.copy()
-                masks = segmentation.get("pred_masks", np.zeros((0, frame.shape[0], frame.shape[1]), dtype=bool))
-                classes = segmentation.get("pred_classes", np.zeros((0,), dtype=np.int64))
-                for mask, cls in zip(masks, classes):
-                    if int(cls) != int(person_class_id):
-                        continue
-                    mask_resized = cv2.resize(mask.astype(np.uint8), (canvas_width, canvas_height), interpolation=cv2.INTER_NEAREST) > 0
-                    overlay[mask_resized] = np.array([0, 0, 255], dtype=np.uint8)
-                cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0, canvas)
+                canvas = cv2.resize(
+                    visualize_instance(frame, segmentation, person_class_id),
+                    (canvas_width, canvas_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
         else:
             canvas = cv2.resize(
                 visualize_semantic(frame, np.asarray(segmentation, dtype=np.int32), person_class_id),
@@ -380,6 +387,15 @@ def render_segmentation_preview(
     dt_text = "none" if sync_dt_ms is None else f"{sync_dt_ms:.1f}"
     cv2.putText(canvas, f"frame={frame_index} lidar_ts={timestamp:.3f} cam_ts={cam_text}", (20, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
     cv2.putText(canvas, f"person_class_id={person_class_id} sync_dt_ms={dt_text}", (20, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    cv2.putText(
+        canvas,
+        f"raw_masks={raw_person_mask_count} selected_masks={0 if selected_person_masks is None else len(selected_person_masks)}",
+        (20, 142),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2,
+    )
     return canvas
 
 
@@ -802,6 +818,26 @@ def draw_points_2d(
         cv2.circle(canvas, (px, py), point_radius, color, -1, lineType=cv2.LINE_AA)
 
 
+def draw_highlight_groups_2d(
+    canvas: np.ndarray,
+    point_groups: list[np.ndarray],
+    axis_a_index: int,
+    axis_b_index: int,
+    axis_a_limits: tuple[float, float],
+    axis_b_limits: tuple[float, float],
+    point_radius: int,
+) -> None:
+    canvas_height, canvas_width = canvas.shape[:2]
+    for group_index, points in enumerate(point_groups):
+        if points.shape[0] == 0:
+            continue
+        color = tuple(int(v) for v in INSTANCE_PALETTE[group_index % len(INSTANCE_PALETTE)])
+        for point in points:
+            draw_point = np.array([point[axis_a_index], point[axis_b_index]], dtype=np.float64)
+            px, py = point_to_canvas(draw_point, axis_a_limits, axis_b_limits, (canvas_width, canvas_height))
+            cv2.circle(canvas, (px, py), point_radius + 1, color, -1, lineType=cv2.LINE_AA)
+
+
 def candidate_color(cluster_id: int) -> tuple[int, int, int]:
     palette = [
         (50, 120, 255),
@@ -902,6 +938,7 @@ def render_debug_image(
     timestamp: float,
     view: str,
     title: str,
+    highlight_groups: list[np.ndarray] | None = None,
 ) -> np.ndarray:
     debug_cfg = config.get("debug", {})
     canvas_width = int(debug_cfg.get("image_width", 1200))
@@ -917,6 +954,8 @@ def render_debug_image(
     if view == "bev":
         render_grid(canvas, x_limits, y_limits)
         draw_points_2d(canvas, points, 0, 1, x_limits, y_limits, z_limits, point_radius)
+        if highlight_groups:
+            draw_highlight_groups_2d(canvas, highlight_groups, 0, 1, x_limits, y_limits, point_radius)
         draw_candidate_boxes_bev(canvas, candidates, x_limits, y_limits)
         draw_track_bev(canvas, state, x_limits, y_limits)
     elif view == "side":
@@ -1135,6 +1174,9 @@ class DebugWriter:
         front_frame: np.ndarray | None = None,
         segmentation: Any = None,
         person_mask: np.ndarray | None = None,
+        selected_person_masks: list[np.ndarray] | None = None,
+        raw_person_mask_count: int = 0,
+        highlight_groups: list[np.ndarray] | None = None,
         person_class_id: int = 19,
         camera_timestamp: float | None = None,
         sync_dt_ms: float | None = None,
@@ -1184,6 +1226,7 @@ class DebugWriter:
                 timestamp=timestamp,
                 view="bev",
                 title="filtered bev",
+                highlight_groups=highlight_groups,
             )
             cv2.imwrite(str(self.output_dir / "filtered_bev" / suffix), filtered_bev)
             overview_images.append(filtered_bev)
@@ -1219,6 +1262,8 @@ class DebugWriter:
                 frame=front_frame,
                 segmentation=segmentation,
                 person_mask=person_mask,
+                selected_person_masks=selected_person_masks,
+                raw_person_mask_count=raw_person_mask_count,
                 frame_index=frame_index,
                 timestamp=timestamp,
                 camera_timestamp=camera_timestamp,
@@ -1310,12 +1355,26 @@ def main() -> None:
             camera_timestamp = None if nearest_sample is None else nearest_sample[1]
             sync_dt_ms = None if camera_timestamp is None else 1000.0 * float(camera_timestamp - timestamp)
             segmentation = None if front_frame is None else segmentation_predictor.predict(front_frame)
-            person_mask = extract_person_mask(segmentation, segmentation_predictor.person_class_id)
+            split_mode = "none" if segmentation_predictor.task in {"instance", "panoptic"} else "auto"
+            person_masks = extract_person_masks(segmentation, segmentation_predictor.person_class_id, split_mode=split_mode)
+            raw_person_mask_count = len(person_masks)
+            min_person_mask_area_px = int(segmentation_cfg.get("min_person_mask_area_px", 3000))
+            max_instances_considered = int(segmentation_cfg.get("max_instances_considered", 3))
+            person_masks = select_relevant_person_masks(
+                person_masks,
+                image_shape=front_frame.shape if front_frame is not None else (0, 0, 0),
+                min_area_px=min_person_mask_area_px,
+                max_instances=max_instances_considered,
+            )
+            person_mask = extract_person_mask(segmentation, segmentation_predictor.person_class_id, split_mode=split_mode)
+            if person_masks:
+                person_mask = np.any(np.stack(person_masks, axis=0), axis=0)
             masked_points, projected_point_count = select_points_in_person_mask(
                 points=processed,
                 person_mask=person_mask,
                 camera_context=camera_context,
             )
+            highlight_groups: list[np.ndarray] = []
 
             clusters = euclidean_clusters(
                 points=processed,
@@ -1324,17 +1383,23 @@ def main() -> None:
                 max_points=int(clustering_cfg["max_cluster_points"]),
             )
             candidates = filter_candidates(clusters, config["person_cluster"])
-            segmentation_clusters = (
-                euclidean_clusters(
-                    points=masked_points,
+            segmentation_candidates: list[ClusterCandidate] = []
+            for instance_mask in person_masks:
+                instance_points, _ = select_points_in_person_mask(
+                    points=processed,
+                    person_mask=instance_mask,
+                    camera_context=camera_context,
+                )
+                if instance_points.shape[0] == 0:
+                    continue
+                highlight_groups.append(instance_points)
+                instance_clusters = euclidean_clusters(
+                    points=instance_points,
                     tolerance=float(clustering_cfg["tolerance_m"]),
                     min_points=int(clustering_cfg["min_cluster_points"]),
                     max_points=int(clustering_cfg["max_cluster_points"]),
                 )
-                if masked_points.shape[0] > 0
-                else []
-            )
-            segmentation_candidates = filter_candidates(segmentation_clusters, config["person_cluster"])
+                segmentation_candidates.extend(filter_candidates(instance_clusters, config["person_cluster"]))
             prioritized_candidates = segmentation_candidates if segmentation_candidates else candidates
             state = tracker.update(timestamp=timestamp, candidates=prioritized_candidates)
             debug_writer.write(
@@ -1345,9 +1410,12 @@ def main() -> None:
                 candidates=prioritized_candidates,
                 state=state,
                 config=config,
-                front_frame=None if front_frame is None else overlay_person_mask(front_frame, person_mask),
+                front_frame=front_frame,
                 segmentation=segmentation,
                 person_mask=person_mask,
+                selected_person_masks=person_masks,
+                raw_person_mask_count=raw_person_mask_count,
+                highlight_groups=highlight_groups,
                 person_class_id=segmentation_predictor.person_class_id,
                 camera_timestamp=camera_timestamp,
                 sync_dt_ms=sync_dt_ms,
@@ -1372,7 +1440,8 @@ def main() -> None:
                 print(
                     f"time={timestamp:.3f} raw={raw_count} filtered={processed.shape[0]} "
                     f"candidates={len(candidates)} seg_candidates={len(segmentation_candidates)} "
-                    f"mask_points={masked_points.shape[0]} sync_dt_ms={sync_dt_ms if sync_dt_ms is not None else 'none'} track={track_text}"
+                    f"mask_points={masked_points.shape[0]} masks={len(person_masks)} "
+                    f"sync_dt_ms={sync_dt_ms if sync_dt_ms is not None else 'none'} track={track_text}"
                 )
             frame_index += 1
     except KeyboardInterrupt:

@@ -5,3 +5,5 @@ outputs/*
 
 data/geo_scan2/*
 data/span/*
+
+*.pkl

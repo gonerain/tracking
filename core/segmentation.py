@@ -11,6 +11,17 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
+INSTANCE_PALETTE = [
+    np.array([255, 80, 80], dtype=np.uint8),
+    np.array([80, 255, 80], dtype=np.uint8),
+    np.array([80, 80, 255], dtype=np.uint8),
+    np.array([255, 200, 80], dtype=np.uint8),
+    np.array([255, 80, 200], dtype=np.uint8),
+    np.array([80, 255, 255], dtype=np.uint8),
+    np.array([200, 120, 255], dtype=np.uint8),
+    np.array([255, 160, 120], dtype=np.uint8),
+]
+
 
 def build_detectron_predictor(conf_file: str, model_file: str, task: str = "semantic") -> Any:
     from detectron2.config import get_cfg
@@ -142,77 +153,165 @@ def visualize_semantic(frame: np.ndarray, segmentation: np.ndarray, person_class
 
 def visualize_instance(frame: np.ndarray, prediction: dict[str, np.ndarray], person_class_id: int) -> np.ndarray:
     vis = frame.copy()
-    masks = prediction.get("pred_masks", np.zeros((0, frame.shape[0], frame.shape[1]), dtype=bool))
-    classes = prediction.get("pred_classes", np.zeros((0,), dtype=np.int64))
-    palette = [
-        np.array([255, 80, 80], dtype=np.uint8),
-        np.array([80, 255, 80], dtype=np.uint8),
-        np.array([80, 80, 255], dtype=np.uint8),
-        np.array([255, 200, 80], dtype=np.uint8),
-        np.array([255, 80, 200], dtype=np.uint8),
-        np.array([80, 255, 255], dtype=np.uint8),
-    ]
-    for index, (mask, cls) in enumerate(zip(masks, classes)):
-        if int(cls) != int(person_class_id):
+    masks = extract_person_masks(prediction, person_class_id, split_mode="none")
+    for index, mask in enumerate(masks):
+        if not np.any(mask):
             continue
+        color = INSTANCE_PALETTE[index % len(INSTANCE_PALETTE)]
         overlay = vis.copy()
-        overlay[mask] = palette[index % len(palette)]
-        cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
+        overlay[mask] = color
+        cv2.addWeighted(overlay, 0.45, vis, 0.55, 0, vis)
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, contours, -1, color.tolist(), 2)
     return vis
 
 
 def visualize_panoptic(frame: np.ndarray, prediction: dict[str, Any], person_class_id: int) -> np.ndarray:
     vis = frame.copy()
-    panoptic_seg = prediction.get("panoptic_seg")
-    segments_info = prediction.get("segments_info", [])
-    if panoptic_seg is None:
-        return vis
-    palette = [
-        np.array([255, 80, 80], dtype=np.uint8),
-        np.array([80, 255, 80], dtype=np.uint8),
-        np.array([80, 80, 255], dtype=np.uint8),
-        np.array([255, 200, 80], dtype=np.uint8),
-        np.array([255, 80, 200], dtype=np.uint8),
-        np.array([80, 255, 255], dtype=np.uint8),
-    ]
-    for index, segment in enumerate(segments_info):
-        if int(segment.get("category_id", -1)) != int(person_class_id):
-            continue
-        mask = panoptic_seg == int(segment["id"])
+    masks = extract_person_masks(prediction, person_class_id, split_mode="none")
+    for index, mask in enumerate(masks):
+        color = INSTANCE_PALETTE[index % len(INSTANCE_PALETTE)]
         overlay = vis.copy()
-        overlay[mask] = palette[index % len(palette)]
-        cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
+        overlay[mask] = color
+        cv2.addWeighted(overlay, 0.45, vis, 0.55, 0, vis)
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, contours, -1, color.tolist(), 2)
     return vis
 
 
-def extract_person_mask(prediction: Any, person_class_id: int) -> np.ndarray | None:
-    if prediction is None:
+def extract_person_mask(prediction: Any, person_class_id: int, split_mode: str = "auto") -> np.ndarray | None:
+    person_masks = extract_person_masks(prediction, person_class_id, split_mode=split_mode)
+    if not person_masks:
         return None
+    return np.any(np.stack(person_masks, axis=0), axis=0)
+
+
+def extract_person_masks(prediction: Any, person_class_id: int, split_mode: str = "auto") -> list[np.ndarray]:
+    if prediction is None:
+        return []
 
     if isinstance(prediction, dict):
         if "pred_masks" in prediction:
             masks = prediction.get("pred_masks", np.zeros((0, 0, 0), dtype=bool))
             classes = prediction.get("pred_classes", np.zeros((0,), dtype=np.int64))
-            person_masks = [np.asarray(mask, dtype=bool) for mask, cls in zip(masks, classes) if int(cls) == int(person_class_id)]
-            if not person_masks:
-                return None
-            return np.any(np.stack(person_masks, axis=0), axis=0)
+            person_masks: list[np.ndarray] = []
+            for mask, cls in zip(masks, classes):
+                if int(cls) != int(person_class_id):
+                    continue
+                mask_bool = np.asarray(mask, dtype=bool)
+                if np.any(mask_bool):
+                    person_masks.append(mask_bool)
+            return person_masks
 
         if "panoptic_seg" in prediction:
             panoptic_seg = prediction.get("panoptic_seg")
             segments_info = prediction.get("segments_info", [])
             if panoptic_seg is None:
-                return None
-            person_mask = np.zeros_like(panoptic_seg, dtype=bool)
+                return []
+            person_masks: list[np.ndarray] = []
             for segment in segments_info:
                 if int(segment.get("category_id", -1)) == int(person_class_id):
-                    person_mask |= panoptic_seg == int(segment["id"])
-            return person_mask if np.any(person_mask) else None
+                    mask = panoptic_seg == int(segment["id"])
+                    if np.any(mask):
+                        person_masks.append(mask)
+            return person_masks
 
-        return None
+        return []
 
     person_mask = np.asarray(prediction, dtype=np.int32) == int(person_class_id)
-    return person_mask if np.any(person_mask) else None
+    if not np.any(person_mask):
+        return []
+    if str(split_mode).lower() == "none":
+        return [person_mask]
+    return _split_touching_instances(person_mask)
+
+
+def select_relevant_person_masks(
+    masks: list[np.ndarray],
+    image_shape: tuple[int, ...],
+    min_area_px: int = 0,
+    max_instances: int | None = None,
+) -> list[np.ndarray]:
+    if not masks:
+        return []
+
+    height, width = int(image_shape[0]), int(image_shape[1])
+    ranked: list[tuple[float, np.ndarray]] = []
+    for mask in masks:
+        mask = np.asarray(mask, dtype=bool)
+        area = int(np.count_nonzero(mask))
+        if area < int(min_area_px):
+            continue
+        ys, xs = np.where(mask)
+        if xs.size == 0:
+            continue
+        bottom = float(ys.max()) / max(height - 1, 1)
+        center_x = float(xs.mean()) / max(width - 1, 1)
+        center_bias = 1.0 - min(abs(center_x - 0.5) / 0.5, 1.0)
+        area_ratio = float(area) / max(height * width, 1)
+        score = 3.0 * area_ratio + 1.5 * bottom + 0.5 * center_bias
+        ranked.append((score, mask))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    selected = [mask for _, mask in ranked]
+    if max_instances is not None:
+        selected = selected[: max(int(max_instances), 0)]
+    return selected
+
+
+def _split_touching_instances(mask: np.ndarray, min_area_px: int = 150, peak_rel_threshold: float = 0.45) -> list[np.ndarray]:
+    mask = np.asarray(mask, dtype=bool)
+    if not np.any(mask):
+        return []
+
+    num_labels, labels = cv2.connectedComponents(mask.astype(np.uint8))
+    instances: list[np.ndarray] = []
+
+    for label_id in range(1, num_labels):
+        component = labels == label_id
+        area = int(np.count_nonzero(component))
+        if area < min_area_px:
+            continue
+
+        dist = cv2.distanceTransform(component.astype(np.uint8), cv2.DIST_L2, 5)
+        max_dist = float(dist.max())
+        if max_dist <= 1e-6:
+            instances.append(component)
+            continue
+
+        peak_mask = (dist >= peak_rel_threshold * max_dist) & component
+        peak_count, peak_labels = cv2.connectedComponents(peak_mask.astype(np.uint8))
+        if peak_count <= 2:
+            instances.append(component)
+            continue
+
+        centroids: list[np.ndarray] = []
+        for peak_id in range(1, peak_count):
+            ys, xs = np.where(peak_labels == peak_id)
+            if xs.size == 0:
+                continue
+            centroids.append(np.array([float(xs.mean()), float(ys.mean())], dtype=np.float32))
+
+        if len(centroids) <= 1:
+            instances.append(component)
+            continue
+
+        ys, xs = np.where(component)
+        points = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+        centroid_array = np.stack(centroids, axis=0)
+        distances = ((points[:, None, :] - centroid_array[None, :, :]) ** 2).sum(axis=2)
+        assignments = np.argmin(distances, axis=1)
+
+        for centroid_index in range(len(centroids)):
+            submask = np.zeros_like(component, dtype=bool)
+            selected = assignments == centroid_index
+            if not np.any(selected):
+                continue
+            submask[ys[selected], xs[selected]] = True
+            if np.count_nonzero(submask) >= min_area_px:
+                instances.append(submask)
+
+    return instances
 
 
 def parse_args() -> argparse.Namespace:

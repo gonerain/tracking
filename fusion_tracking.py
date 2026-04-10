@@ -27,7 +27,7 @@ from core.lidar_tracking import (
     render_debug_image,
     render_target_crop_image,
 )
-from core.segmentation import SegmentationPredictor
+from core.segmentation import SegmentationPredictor, extract_person_masks, select_relevant_person_masks
 from core.tracking import TargetTracker, draw_tracking_overlay, select_target
 
 ROOT = Path(__file__).resolve().parent
@@ -51,8 +51,10 @@ class ArucoDebugState:
     results: list[dict[str, Any]]
     tracking_state: Any
     target_result: dict[str, Any] | None
-    segmentation: np.ndarray | None
+    segmentation: Any
     target_person_mask: np.ndarray | None
+    selected_person_masks: list[np.ndarray]
+    raw_person_mask_count: int
 
 
 class ArucoPriorProvider:
@@ -74,8 +76,11 @@ class ArucoPriorProvider:
         self.latest_tracking_state: Any = None
         self.latest_target_result: dict[str, Any] | None = None
         self.segmentation_predictor = SegmentationPredictor(config)
-        self.latest_segmentation: np.ndarray | None = None
+        self.segmentation_cfg = config.get("segmentation", {})
+        self.latest_segmentation: Any = None
         self.latest_target_person_mask: np.ndarray | None = None
+        self.latest_selected_person_masks: list[np.ndarray] = []
+        self.latest_raw_person_mask_count = 0
         sync_cfg = config.get("sync", {})
         self.sync_max_dt_s = float(sync_cfg.get("camera_sync_max_dt_s", 0.08))
         self.latest_sync_dt_ms: float | None = None
@@ -107,11 +112,17 @@ class ArucoPriorProvider:
             target = select_target(results, self.target_id)
             self.latest_target_result = target
             self.latest_segmentation = self.segmentation_predictor.predict(frame)
-            self.latest_target_person_mask = select_target_person_mask(
+            (
+                self.latest_target_person_mask,
+                self.latest_selected_person_masks,
+                self.latest_raw_person_mask_count,
+            ) = select_target_person_mask(
                 frame=frame,
                 segmentation=self.latest_segmentation,
                 target_result=target,
                 person_class_id=self.segmentation_predictor.person_class_id,
+                min_area_px=int(self.segmentation_cfg.get("min_person_mask_area_px", 3000)),
+                max_instances=int(self.segmentation_cfg.get("max_instances_considered", 3)),
             )
             if target is not None:
                 self.latest_tracking_state = self.tracker.update(
@@ -192,6 +203,8 @@ class ArucoPriorProvider:
             target_result=self.latest_target_result,
             segmentation=None if self.latest_segmentation is None else self.latest_segmentation.copy(),
             target_person_mask=None if self.latest_target_person_mask is None else self.latest_target_person_mask.copy(),
+            selected_person_masks=[mask.copy() for mask in self.latest_selected_person_masks],
+            raw_person_mask_count=int(self.latest_raw_person_mask_count),
         )
 
 
@@ -200,56 +213,41 @@ def select_target_person_mask(
     segmentation: Any,
     target_result: dict[str, Any] | None,
     person_class_id: int = 19,
-) -> np.ndarray | None:
+) -> tuple[np.ndarray | None, list[np.ndarray], int]:
     if segmentation is None or target_result is None:
-        return None
+        return None, [], 0
 
-    if isinstance(segmentation, dict):
-        if "pred_masks" in segmentation:
-            masks = segmentation.get("pred_masks", np.zeros((0, frame.shape[0], frame.shape[1]), dtype=bool))
-            classes = segmentation.get("pred_classes", np.zeros((0,), dtype=np.int64))
-            person_masks = [np.asarray(mask, dtype=bool) for mask, cls in zip(masks, classes) if int(cls) == int(person_class_id)]
-            if not person_masks:
-                return None
-            person_mask = np.any(np.stack(person_masks, axis=0), axis=0)
-        elif "panoptic_seg" in segmentation:
-            panoptic_seg = segmentation.get("panoptic_seg")
-            segments_info = segmentation.get("segments_info", [])
-            if panoptic_seg is None:
-                return None
-            person_mask = np.zeros_like(panoptic_seg, dtype=bool)
-            for segment in segments_info:
-                if int(segment.get("category_id", -1)) == int(person_class_id):
-                    person_mask |= panoptic_seg == int(segment["id"])
-        else:
-            return None
-    else:
-        person_mask = np.asarray(segmentation, dtype=np.int32) == int(person_class_id)
-
-    if not np.any(person_mask):
-        return None
+    split_mode = "none" if isinstance(segmentation, dict) else "auto"
+    person_masks = extract_person_masks(segmentation, person_class_id, split_mode=split_mode)
+    raw_person_mask_count = len(person_masks)
+    person_masks = select_relevant_person_masks(
+        person_masks,
+        image_shape=frame.shape,
+        min_area_px=min_area_px,
+        max_instances=max_instances,
+    )
+    if not person_masks:
+        return None, [], raw_person_mask_count
 
     center = np.round(target_result["center_projected_px"]).astype(int)
-    h, w = person_mask.shape[:2]
+    h, w = frame.shape[:2]
     cx = int(np.clip(center[0], 0, w - 1))
     cy = int(np.clip(center[1], 0, h - 1))
-
-    if not person_mask[cy, cx]:
-        ys, xs = np.where(person_mask)
+    best_mask = None
+    best_distance = None
+    for mask in person_masks:
+        mask = np.asarray(mask, dtype=bool)
+        if mask[cy, cx]:
+            return mask, person_masks, raw_person_mask_count
+        ys, xs = np.where(mask)
         if xs.size == 0:
-            return None
+            continue
         distances = (xs - cx) ** 2 + (ys - cy) ** 2
-        nearest_idx = int(np.argmin(distances))
-        cx = int(xs[nearest_idx])
-        cy = int(ys[nearest_idx])
-
-    num_labels, labels, _, _ = cv2.connectedComponents(person_mask.astype(np.uint8))
-    if num_labels <= 1:
-        return person_mask
-    target_label = int(labels[cy, cx])
-    if target_label == 0:
-        return None
-    return labels == target_label
+        nearest_distance = float(np.min(distances))
+        if best_mask is None or nearest_distance < best_distance:
+            best_mask = mask
+            best_distance = nearest_distance
+    return best_mask, person_masks, raw_person_mask_count
 
 
 def overlay_target_mask(frame: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
@@ -345,6 +343,15 @@ class FusionDebugWriter:
         if aruco_debug.target_person_mask is not None:
             mask_pixels = int(np.count_nonzero(aruco_debug.target_person_mask))
             cv2.putText(vis, f"target_mask_pixels={mask_pixels}", (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(
+            vis,
+            f"raw_masks={aruco_debug.raw_person_mask_count} selected_masks={len(aruco_debug.selected_person_masks)}",
+            (20, 158),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            2,
+        )
         return vis
 
     def _pad_tile(self, image: np.ndarray) -> np.ndarray:
@@ -578,8 +585,11 @@ def main() -> None:
     args = parse_args()
     aruco_config = load_aruco_config(args.aruco_config)
     lidar_config = load_aruco_config(args.lidar_config)
+    aruco_runtime_config = dict(aruco_config)
+    aruco_runtime_config["segmentation"] = dict(lidar_config.get("segmentation", {}))
+    aruco_runtime_config["sync"] = dict(lidar_config.get("sync", {}))
 
-    aruco_provider = ArucoPriorProvider(aruco_config)
+    aruco_provider = ArucoPriorProvider(aruco_runtime_config)
     lidar_source = RosbagLidarSource(lidar_config)
 
     clustering_cfg = lidar_config["clustering"]
