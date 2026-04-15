@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from core.segmentation import main
+from _bootstrap import bootstrap
+
+
+def run() -> None:
+    from core.segmentation import main
+
+    main()
 
 
 if __name__ == "__main__":
-    main()
+    bootstrap(run)

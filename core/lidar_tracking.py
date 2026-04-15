@@ -42,6 +42,8 @@ class TrackState:
     velocity: np.ndarray
     source: str
     candidate: ClusterCandidate | None
+    track_quality: float = 0.0
+    track_lifecycle: str = "tentative"
 
 
 @dataclass
@@ -488,13 +490,46 @@ def remove_ego_vehicle_points(points: np.ndarray, ego_cfg: dict[str, Any]) -> np
 
 def remove_ground(points: np.ndarray, ground_cfg: dict[str, Any]) -> np.ndarray:
     method = str(ground_cfg.get("method", "z_threshold"))
-    if method != "z_threshold":
-        raise ValueError(f"Unsupported ground removal method: {method}")
-
     z_min = float(ground_cfg.get("z_min", -math.inf))
     z_max = float(ground_cfg.get("z_max", math.inf))
-    mask = (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
-    return points[mask]
+    valid_z = (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
+    points = points[valid_z]
+    if points.size == 0:
+        return points
+
+    if method == "z_threshold":
+        return points
+    if method != "adaptive_grid":
+        raise ValueError(f"Unsupported ground removal method: {method}")
+
+    cell_size_m = max(float(ground_cfg.get("cell_size_m", 0.4)), 1e-3)
+    ground_quantile = float(np.clip(ground_cfg.get("ground_quantile", 0.15), 0.0, 1.0))
+    clearance_m = float(ground_cfg.get("clearance_m", 0.12))
+    min_points_per_cell = max(int(ground_cfg.get("min_points_per_cell", 6)), 1)
+    fallback_clearance_m = float(ground_cfg.get("fallback_clearance_m", 0.18))
+
+    grid_xy = np.floor(points[:, :2] / cell_size_m).astype(np.int32)
+    cell_to_indices: dict[tuple[int, int], list[int]] = {}
+    for index, (gx, gy) in enumerate(grid_xy):
+        key = (int(gx), int(gy))
+        if key not in cell_to_indices:
+            cell_to_indices[key] = []
+        cell_to_indices[key].append(index)
+
+    keep = np.zeros(points.shape[0], dtype=bool)
+    for indices in cell_to_indices.values():
+        cell_points = points[np.asarray(indices, dtype=np.int32)]
+        cell_z = cell_points[:, 2]
+        if cell_z.shape[0] < min_points_per_cell:
+            local_ground = float(np.min(cell_z))
+            local_clearance = fallback_clearance_m
+        else:
+            local_ground = float(np.quantile(cell_z, ground_quantile))
+            local_clearance = clearance_m
+        keep_cell = cell_z >= (local_ground + local_clearance)
+        for local_idx, src_idx in enumerate(indices):
+            keep[src_idx] = bool(keep_cell[local_idx])
+    return points[keep]
 
 
 def pairwise_distances(points: np.ndarray) -> np.ndarray:
@@ -611,14 +646,52 @@ def filter_candidates(clusters: list[np.ndarray], person_cfg: dict[str, Any]) ->
 
 
 class SimpleTracker:
-    def __init__(self, gating_distance_m: float, max_prediction_duration_s: float, process_gain: float) -> None:
+    def __init__(
+        self,
+        gating_distance_m: float,
+        max_prediction_duration_s: float,
+        process_gain: float,
+        allow_prediction: bool = False,
+        confirm_hits: int = 3,
+        forget_misses: int = 8,
+        quality_hit_gain: float = 0.2,
+        quality_miss_decay: float = 0.85,
+    ) -> None:
         self.gating_distance_m = float(gating_distance_m)
         self.max_prediction_duration_s = float(max_prediction_duration_s)
         self.process_gain = float(process_gain)
+        self.allow_prediction = bool(allow_prediction)
+        self.confirm_hits = max(int(confirm_hits), 1)
+        self.forget_misses = max(int(forget_misses), 1)
+        self.quality_hit_gain = float(np.clip(quality_hit_gain, 1e-3, 1.0))
+        self.quality_miss_decay = float(np.clip(quality_miss_decay, 0.1, 0.999))
         self.last_state: TrackState | None = None
         self.last_observed_timestamp: float | None = None
+        self.track_quality: float = 0.0
+        self.track_lifecycle: str = "tentative"
+        self.consecutive_hits: int = 0
+        self.consecutive_misses: int = 0
+
+    def _on_hit(self) -> None:
+        self.consecutive_hits += 1
+        self.consecutive_misses = 0
+        self.track_quality = self.track_quality + self.quality_hit_gain * (1.0 - self.track_quality)
+        if self.consecutive_hits >= self.confirm_hits:
+            self.track_lifecycle = "confirmed"
+        elif self.track_lifecycle == "lost":
+            self.track_lifecycle = "tentative"
+
+    def _on_miss(self) -> None:
+        self.consecutive_hits = 0
+        self.consecutive_misses += 1
+        self.track_quality *= self.quality_miss_decay
+        if self.consecutive_misses >= self.forget_misses:
+            self.track_lifecycle = "lost"
+            self.track_quality = 0.0
 
     def _predict_state(self, timestamp: float) -> TrackState | None:
+        if not self.allow_prediction:
+            return None
         if self.last_state is None:
             return None
 
@@ -637,6 +710,8 @@ class SimpleTracker:
             velocity=self.last_state.velocity.copy(),
             source="predicted",
             candidate=None,
+            track_quality=self.track_quality,
+            track_lifecycle=self.track_lifecycle,
         )
 
     def update(self, timestamp: float, candidates: list[ClusterCandidate]) -> TrackState | None:
@@ -656,10 +731,15 @@ class SimpleTracker:
                     selected = best
 
         if selected is None:
+            self._on_miss()
             self.last_state = predicted
+            if self.last_state is not None:
+                self.last_state.track_quality = self.track_quality
+                self.last_state.track_lifecycle = self.track_lifecycle
             return predicted
 
         measurement = selected.footpoint.copy()
+        self._on_hit()
         if self.last_state is None:
             new_state = TrackState(
                 timestamp=timestamp,
@@ -667,6 +747,8 @@ class SimpleTracker:
                 velocity=np.zeros(3, dtype=np.float64),
                 source="observed",
                 candidate=selected,
+                track_quality=self.track_quality,
+                track_lifecycle=self.track_lifecycle,
             )
             self.last_state = new_state
             self.last_observed_timestamp = timestamp
@@ -682,6 +764,8 @@ class SimpleTracker:
             velocity=new_velocity,
             source="observed",
             candidate=selected,
+            track_quality=self.track_quality,
+            track_lifecycle=self.track_lifecycle,
         )
         self.last_state = new_state
         self.last_observed_timestamp = timestamp
@@ -730,6 +814,8 @@ def format_record(
         if state is None
         else {
             "state": state.source,
+            "lifecycle": state.track_lifecycle,
+            "quality": round(float(state.track_quality), 6),
             "position_lidar_m": np.round(state.position, 6).tolist(),
             "velocity_lidar_mps": np.round(state.velocity, 6).tolist(),
             "selected_candidate": None if state.candidate is None else format_candidate(state.candidate),
@@ -1320,6 +1406,11 @@ def main() -> None:
         gating_distance_m=float(tracker_cfg.get("gating_distance_m", 1.0)),
         max_prediction_duration_s=float(tracker_cfg.get("max_prediction_duration_s", 0.5)),
         process_gain=float(tracker_cfg.get("process_gain", 0.6)),
+        allow_prediction=bool(tracker_cfg.get("allow_prediction", False)),
+        confirm_hits=int(tracker_cfg.get("confirm_hits", 3)),
+        forget_misses=int(tracker_cfg.get("forget_misses", 8)),
+        quality_hit_gain=float(tracker_cfg.get("quality_hit_gain", 0.2)),
+        quality_miss_decay=float(tracker_cfg.get("quality_miss_decay", 0.85)),
     )
     front_camera_reader = RecentFrontCameraReader(config)
     segmentation_predictor = SegmentationPredictor(config)

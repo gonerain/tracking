@@ -6,7 +6,7 @@ input:
     height: 1024
     fps: 10
   rosbag:
-    bag_path: data/geo_scan2/data_0.bag
+    bag_path: data/2026-04-14_mongkok-opensky-walk-006/rosbag/segment_2026-04-14-17-32-00_3.bag
     topic: /front_camera/image/compressed
     start_time_s: 0.0
     end_time_s: null
@@ -49,8 +49,16 @@ target_frame:
   translation_m: [0.051401176491, 0.015593452288, -0.06077996213]
 
 tracking:
-  target_id: 0
+  target_ids: [0, 1, 2, 3]
+  # Per-marker offset from marker center to tracking reference point in lidar frame.
+  # The values below align ArUco prior to lidar footpoint semantics.
+  target_offsets_m:
+    "0": [1.2793, 0.0753, -0.2528]
+    "1": [1.2793, 0.0753, -0.2528]
+    "2": [1.2793, 0.0753, -0.2528]
+    "3": [1.2793, 0.0753, -0.2528]
   history_size: 10
+  allow_prediction: false
   max_prediction_duration_s: 1.0
 
 logging:

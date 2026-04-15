@@ -24,9 +24,10 @@ class TrackState:
 
 
 class TargetTracker:
-    def __init__(self, history_size: int, max_prediction_duration_s: float) -> None:
+    def __init__(self, history_size: int, max_prediction_duration_s: float, allow_prediction: bool = False) -> None:
         self.history: deque[TrackState] = deque(maxlen=history_size)
         self.max_prediction_duration_s = float(max_prediction_duration_s)
+        self.allow_prediction = bool(allow_prediction)
         self.last_observed: TrackState | None = None
 
     def update(
@@ -48,6 +49,8 @@ class TargetTracker:
         return state
 
     def predict(self, timestamp: float) -> TrackState | None:
+        if not self.allow_prediction:
+            return None
         if self.last_observed is None:
             return None
 
@@ -134,20 +137,78 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def select_target(results: list[dict[str, Any]], target_id: int) -> dict[str, Any] | None:
-    for result in results:
-        if int(result["id"]) == int(target_id):
-            return result
-    return None
+def get_target_ids(tracking_cfg: dict[str, Any]) -> list[int]:
+    target_ids_cfg = tracking_cfg.get("target_ids")
+    if target_ids_cfg is not None:
+        return [int(target_id) for target_id in target_ids_cfg]
+    return [int(tracking_cfg["target_id"])]
 
 
-def format_record(timestamp: float, target_id: int, state: TrackState | None, visible: bool) -> dict[str, Any]:
+def target_ids_label(target_ids: list[int]) -> str:
+    return ",".join(str(target_id) for target_id in target_ids)
+
+
+def get_target_offsets(tracking_cfg: dict[str, Any], target_ids: list[int]) -> dict[int, np.ndarray]:
+    offsets_cfg = tracking_cfg.get("target_offsets_m", {})
+    offsets: dict[int, np.ndarray] = {}
+    for target_id in target_ids:
+        raw_value = offsets_cfg.get(str(target_id), offsets_cfg.get(target_id))
+        if raw_value is None:
+            offsets[target_id] = np.zeros(3, dtype=np.float64)
+            continue
+        offsets[target_id] = np.asarray(raw_value, dtype=np.float64).reshape(3)
+    return offsets
+
+
+def select_target(results: list[dict[str, Any]], target_ids: int | list[int], target_offsets: dict[int, np.ndarray] | None = None) -> dict[str, Any] | None:
+    if isinstance(target_ids, int):
+        target_id_list = [int(target_ids)]
+    else:
+        target_id_list = [int(target_id) for target_id in target_ids]
+    target_id_set = set(target_id_list)
+    matched = [result for result in results if int(result["id"]) in target_id_set]
+    if not matched:
+        return None
+
+    offsets = target_offsets or {}
+    camera_centers = [np.asarray(result["center_in_camera_m"], dtype=np.float64) for result in matched]
+    target_centers = [
+        np.asarray(result["center_in_target_m"], dtype=np.float64) + offsets.get(int(result["id"]), np.zeros(3, dtype=np.float64))
+        for result in matched
+    ]
+    projected_centers = [np.asarray(result["center_projected_px"], dtype=np.float64) for result in matched]
+    corners_list = [np.asarray(result["corners"], dtype=np.float64) for result in matched]
+    corner_points = np.concatenate(corners_list, axis=0)
+    min_corner = corner_points.min(axis=0)
+    max_corner = corner_points.max(axis=0)
+    combined_corners = np.array(
+        [
+            [min_corner[0], min_corner[1]],
+            [max_corner[0], min_corner[1]],
+            [max_corner[0], max_corner[1]],
+            [min_corner[0], max_corner[1]],
+        ],
+        dtype=np.float64,
+    )
+
+    return {
+        "id": target_id_list[0] if len(target_id_list) == 1 else target_id_list,
+        "visible_ids": [int(result["id"]) for result in matched],
+        "corners": combined_corners,
+        "center_in_camera_m": np.mean(np.stack(camera_centers, axis=0), axis=0),
+        "center_in_target_m": np.mean(np.stack(target_centers, axis=0), axis=0),
+        "center_projected_px": np.mean(np.stack(projected_centers, axis=0), axis=0),
+    }
+
+
+def format_record(timestamp: float, target_ids: list[int], state: TrackState | None, visible: bool, visible_ids: list[int]) -> dict[str, Any]:
     iso_time = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat()
     if state is None:
         return {
             "timestamp": timestamp,
             "datetime": iso_time,
-            "target_id": target_id,
+            "target_ids": target_ids,
+            "visible_ids": visible_ids,
             "visible": visible,
             "tracking_state": "lost",
             "position_camera_m": None,
@@ -158,7 +219,8 @@ def format_record(timestamp: float, target_id: int, state: TrackState | None, vi
     return {
         "timestamp": timestamp,
         "datetime": iso_time,
-        "target_id": target_id,
+        "target_ids": target_ids,
+        "visible_ids": visible_ids,
         "visible": visible,
         "tracking_state": state.source,
         "position_camera_m": np.round(state.position_camera, 6).tolist(),
@@ -167,14 +229,15 @@ def format_record(timestamp: float, target_id: int, state: TrackState | None, vi
     }
 
 
-def draw_tracking_overlay(frame: np.ndarray, target_id: int, state: TrackState | None) -> np.ndarray:
+def draw_tracking_overlay(frame: np.ndarray, target_label: str, state: TrackState | None, visible_ids: list[int] | None = None) -> np.ndarray:
     output = frame.copy()
+    visible_text = "none" if not visible_ids else ",".join(str(target_id) for target_id in visible_ids)
     if state is None:
-        cv2.putText(output, f"target_id={target_id} status=lost", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(output, f"target_ids={target_label} visible_ids={visible_text} status=lost", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
         return output
 
     color = (0, 255, 0) if state.source == "observed" else (0, 255, 255)
-    text = f"target_id={target_id} status={state.source} pos={np.round(state.position_target, 3).tolist()}"
+    text = f"target_ids={target_label} visible_ids={visible_text} status={state.source} pos={np.round(state.position_target, 3).tolist()}"
     cv2.putText(output, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     if state.source == "predicted" and state.corners is not None:
@@ -195,10 +258,13 @@ def main() -> None:
     tracking_cfg = config.get("tracking", {})
     logging_cfg = config.get("logging", {})
     display_cfg = config.get("display", {})
-    target_id = int(tracking_cfg["target_id"])
+    target_ids = get_target_ids(tracking_cfg)
+    target_offsets = get_target_offsets(tracking_cfg, target_ids)
+    target_label = target_ids_label(target_ids)
     tracker = TargetTracker(
         history_size=int(tracking_cfg.get("history_size", 10)),
         max_prediction_duration_s=float(tracking_cfg.get("max_prediction_duration_s", 1.0)),
+        allow_prediction=bool(tracking_cfg.get("allow_prediction", False)),
     )
     logger = JsonLogger(
         output_path=logging_cfg.get("output_json", "tracking_log.json"),
@@ -223,7 +289,8 @@ def main() -> None:
         timestamp = first_timestamp
         while True:
             results = detect_markers(frame, context)
-            target = select_target(results, target_id)
+            target = select_target(results, target_ids, target_offsets)
+            visible_ids = [] if target is None else list(target.get("visible_ids", []))
 
             if target is not None:
                 state = tracker.update(
@@ -234,15 +301,15 @@ def main() -> None:
                 )
                 visible = True
             else:
-                state = tracker.predict(timestamp)
+                state = None
                 visible = False
 
-            record = format_record(timestamp, target_id, state, visible)
+            record = format_record(timestamp, target_ids, state, visible, visible_ids)
             logger.append(record)
             print(json.dumps(record, ensure_ascii=False))
 
             vis = draw_results(frame, results, context)
-            vis = draw_tracking_overlay(vis, target_id, state)
+            vis = draw_tracking_overlay(vis, target_label, state, visible_ids)
             video_logger.write(vis)
 
             if display_enabled:

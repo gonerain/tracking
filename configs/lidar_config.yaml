@@ -1,6 +1,6 @@
 input:
   rosbag:
-    bag_path: data/geo_scan2/data_0.bag
+    bag_path: data/2026-04-14_mongkok-opensky-walk-006/rosbag/segment_2026-04-14-17-32-00_3.bag
     topic: /lidar
     start_time_s: null
     end_time_s: null
@@ -12,6 +12,19 @@ roi:
   min_radius_m: 0.5
   radius_m: 10.0
   z: [-1.5, 3.0]
+  local_with_aruco:
+    enabled: true
+    half_width_m: 3.2
+    half_height_m: 2.8
+    z_min_offset_m: -1.2
+    z_max_offset_m: 1.8
+    expand_after_reconnect_frames: 2
+    expanded_half_width_m: 4.8
+    expanded_half_height_m: 4.2
+    expanded_z_min_offset_m: -1.4
+    expanded_z_max_offset_m: 2.0
+    recovery_trigger_frames: 2
+    recovery_disable_frames: 4
 
 ego_vehicle_filter:
   enabled: true
@@ -20,20 +33,49 @@ ego_vehicle_filter:
   z: [-2.0, 2.0]
 
 ground_removal:
-  method: z_threshold
-  z_min: 0.2
+  method: adaptive_grid
+  z_min: 0.12
   z_max: 3.0
+  cell_size_m: 0.45
+  ground_quantile: 0.18
+  clearance_m: 0.10
+  min_points_per_cell: 6
+  fallback_clearance_m: 0.16
 
 clustering:
   tolerance_m: 0.45
-  min_cluster_points: 8
+  min_cluster_points: 6
   max_cluster_points: 5000
 
+detector:
+  enabled: true
+  # cluster | centerpoint | hybrid
+  source: hybrid
+  dedup_distance_m: 0.4
+  centerpoint:
+    # none | mmdet3d | python_module
+    provider: mmdet3d
+    score_threshold: 0.2
+    # Label ids considered person class by the detector.
+    person_label_ids: [0]
+    # mmdet3d backend
+    config_path: "checkpoints/centerpoint/centerpoint_nus.py"
+    checkpoint_path: "checkpoints/centerpoint/centerpoint_nus.pth"
+    device: cuda:0
+    # python_module backend: function(points_xyz: np.ndarray, timestamp: float) -> list[dict]
+    module_path: ""
+    function_name: infer
+
 person_cluster:
-  min_points: 6
+  min_points: 4
+  min_points_with_aruco: 3
   height_m: [0.5, 2.6]
+  height_m_with_aruco: [0.4, 2.8]
   width_m: [0.10, 1.8]
+  width_m_with_aruco: [0.08, 2.2]
   depth_m: [0.08, 1.8]
+  depth_m_with_aruco: [0.08, 2.2]
+  aruco_rescue_distance_m: 1.2
   height_preferred_m: 1.6
   width_preferred_m: 0.7
   depth_preferred_m: 0.6
@@ -41,8 +83,38 @@ person_cluster:
 
 tracker:
   gating_distance_m: 1.2
+  allow_prediction: false
   max_prediction_duration_s: 0.6
   process_gain: 0.65
+  confirm_hits: 3
+  forget_misses: 8
+  quality_hit_gain: 0.22
+  quality_miss_decay: 0.86
+  aruco_gate_sigma_m: 0.75
+  aruco_hard_gate_multiplier: 1.8
+  aruco_min_combined_score: 0.08
+  aruco_motion_sigma_floor_m: 0.5
+  max_footpoint_z_m: 0.8
+  max_footpoint_z_with_aruco_m: 1.2
+  max_planar_jump_m: 1.0
+  max_planar_jump_with_aruco_m: 1.4
+  max_vertical_jump_m: 0.6
+  max_planar_speed_mps: 3.5
+  max_planar_speed_with_aruco_mps: 5.0
+  max_vertical_speed_mps: 2.5
+  reconnect_relax_after_frames: 2
+  reconnect_max_footpoint_z_m: 1.4
+  reconnect_max_planar_jump_m: 2.8
+  reconnect_max_planar_speed_mps: 6.0
+  rescue_max_footpoint_z_m: 1.4
+  rescue_max_planar_jump_m: 2.0
+  rescue_max_distance_to_aruco_m: 1.5
+  near_aruco_distance_m: 0.9
+  near_aruco_max_footpoint_z_m: 1.45
+  near_aruco_bypass_planar_jump: true
+  near_aruco_max_planar_jump_m: 2.6
+  near_aruco_max_planar_speed_mps: 7.0
+  hold_without_match_duration_s: 0.4
 
 logging:
   output_json: outputs/lidar_tracking_log.json
@@ -61,6 +133,7 @@ segmentation:
   person_class_id: 0
   min_person_mask_area_px: 8000
   max_instances_considered: 5
+  candidate_dedup_distance_m: 0.2
   camera_config: configs/aruco_config.yaml
 
 debug:

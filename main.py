@@ -5,13 +5,20 @@ import sys
 from typing import Callable
 
 from core.detect_aruco import main as detect_aruco_main
+from core.fusion_tracking import main as fusion_tracking_main
 from core.lidar_tracking import main as lidar_tracking_main
 from core.segmentation import main as segment_image_main
 from core.tracking import main as tracking_main
-from fusion_tracking import main as fusion_tracking_main
 
 
 EntryPoint = Callable[[], None]
+ENTRYPOINTS: dict[str, EntryPoint] = {
+    "detect_aruco": detect_aruco_main,
+    "tracking": tracking_main,
+    "lidar_tracking": lidar_tracking_main,
+    "segment_image": segment_image_main,
+    "fusion_tracking": fusion_tracking_main,
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,17 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def dispatch(command: str) -> EntryPoint:
-    if command == "detect_aruco":
-        return detect_aruco_main
-    if command == "tracking":
-        return tracking_main
-    if command == "lidar_tracking":
-        return lidar_tracking_main
-    if command == "segment_image":
-        return segment_image_main
-    if command == "fusion_tracking":
-        return fusion_tracking_main
-    raise ValueError(f"Unsupported command: {command}")
+    try:
+        return ENTRYPOINTS[command]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported command: {command}") from exc
 
 
 def main() -> None:
