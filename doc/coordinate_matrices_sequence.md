@@ -116,31 +116,50 @@
 
 ---
 
-## 8) 姿态：Body(FRD) -> NED（每帧动态）
+## 8) 姿态：ENU -> Body(RFU)（CPT7 原始输出）
 
-由 IE/SPAN 的 `roll/pitch/heading` 构建：
+SPAN CPT7 的 `roll/pitch/azimuth` 直接定义 ENU 到车体 RFU 系的基变换：
 
 ```text
-R_NED<-body = Rz(heading) * Rx(pitch) * Ry(roll)
+C_{ENU->RFU}(R, P, A) = R_y(R) * R_x(P) * R_z(-A)
+```
+
+各 `R_*(θ)` 为 passive 旋转（基变换）：
+
+```text
+R_y(R) =
+[[ cos(R), 0, -sin(R)],
+ [ 0,      1,  0     ],
+ [ sin(R), 0,  cos(R)]]
+
+R_x(P) =
+[[1, 0,       0     ],
+ [0,  cos(P), sin(P)],
+ [0, -sin(P), cos(P)]]
+
+R_z(-A) =
+[[ cos(A), -sin(A), 0],
+ [ sin(A),  cos(A), 0],
+ [ 0,       0,      1]]
 ```
 
 其中：
 
-- `heading`: body x 轴与正北夹角，顺时针为正。
-- `pitch`: 绕 x 轴右手旋转。
-- `roll`: 绕 y 轴右手旋转。
-- 以上与 NovAtel SPAN 的姿态字段定义一致，采用 Z-X-Y 序列。
+- `A`: azimuth，ENU 中相对正北顺时针角。
+- `P`: pitch，绕 x_RFU（右）轴。
+- `R`: roll，绕 y_RFU（前）轴。
 
 ---
 
-## 9) NED -> ENU（固定）
+## 9) RFU <-> FRD（固定轴变换）
 
-`R_ENU<-NED`
+span_link 在外参链中定义为 FRD，所以 CPT7 的 RFU 与 span_link 的 FRD 之间需要一次静态轴变换。该矩阵为对合（involution），两方向相同：
 
 ```text
-[[ 0.,  1.,  0.],
- [ 1.,  0.,  0.],
- [ 0.,  0., -1.]]
+R_{RFU<-FRD} = R_{FRD<-RFU} =
+[[0, 1,  0],
+ [1, 0,  0],
+ [0, 0, -1]]
 ```
 
 ---
@@ -148,7 +167,8 @@ R_NED<-body = Rz(heading) * Rx(pitch) * Ry(roll)
 ## 10) Body(FRD) -> ENU（每帧动态）
 
 ```text
-R_ENU<-body = R_ENU<-NED * R_NED<-body
+R_{ENU<-RFU} = (C_{ENU->RFU})^T
+R_{ENU<-body(FRD)} = R_{ENU<-RFU} * R_{RFU<-FRD}
 ```
 
 这个矩阵用于：
@@ -161,79 +181,45 @@ R_ENU<-body = R_ENU<-NED * R_NED<-body
 目标是把世界系 ENU 点转换到 SPAN body（FRD）：
 
 ```text
-p_body = R_body<-ENU * (p_ENU - p_span_ENU)
+p_body = R_{body<-ENU} * (p_ENU - p_span_ENU)
 ```
 
 其中 `p_span_ENU` 是该帧 SPAN 原点在 ENU 中的位置。
 
-先由 IE/SPAN 姿态构建 `R_ENU<-body`，再转置得到 `R_body<-ENU`：
+#### Step 1: CPT7 RPY -> R_{RFU<-ENU}
 
 ```text
-R_body<-ENU = (R_ENU<-body)^T
+R_{RFU<-ENU} = R_y(R) * R_x(P) * R_z(-A)
 ```
 
-#### Step 1: Body(FRD) -> NED
-
-按当前实现：
+#### Step 2: 转置得到 R_{ENU<-RFU}
 
 ```text
-R_NED<-body = Rz(heading) * Rx(pitch) * Ry(roll)
+R_{ENU<-RFU} = (R_{RFU<-ENU})^T
 ```
 
-```text
-Rx(pitch) =
-[[1, 0, 0],
- [0, cos(pitch), -sin(pitch)],
- [0, sin(pitch),  cos(pitch)]]
-```
+#### Step 3: RFU -> FRD 轴变换
 
 ```text
-Ry(roll) =
-[[ cos(roll), 0, sin(roll)],
- [ 0,         1, 0        ],
- [-sin(roll), 0, cos(roll)]]
-```
-
-```text
-Rz(heading) =
-[[cos(heading), -sin(heading), 0],
- [sin(heading),  cos(heading), 0],
- [0,             0,            1]]
-```
-
-注：`heading` 为 NED 中相对正北顺时针角（与代码一致）。
-
-#### Step 2: NED -> ENU
-
-```text
-R_ENU<-NED =
-[[0, 1,  0],
- [1, 0,  0],
- [0, 0, -1]]
-```
-
-#### Step 3: Body(FRD) -> ENU
-
-```text
-R_ENU<-body = R_ENU<-NED * R_NED<-body
+R_{ENU<-FRD} = R_{ENU<-RFU} * R_{RFU<-FRD}
 ```
 
 #### Step 4: ENU -> Body(FRD)
 
 ```text
-R_body<-ENU = (R_ENU<-body)^T
+R_{body(FRD)<-ENU} = (R_{ENU<-FRD})^T
 ```
 
 代入点变换即：
 
 ```text
-p_body = (R_ENU<-body)^T * (p_ENU - p_span_ENU)
+p_body = (R_{ENU<-FRD})^T * (p_ENU - p_span_ENU)
 ```
 
 与当前代码的行向量写法等价：
 
 ```text
-pts_body = (pts_world - span_enu) @ R_ENU<-body
+pts_body = (pts_world - span_enu) @ R_{ENU<-FRD}
 ```
 
 ---
