@@ -229,13 +229,13 @@ def _deg2rad(value_deg: float) -> float:
 
 
 def rotation_matrix_from_ie(roll_deg: float, pitch_deg: float, heading_deg: float) -> np.ndarray:
-    # SPAN CPT7 attitude output defines the change-of-basis from ENU to the
-    # vehicle RFU (Right/Forward/Up) frame:
+    # SPAN CPT7 attitude output defines the change-of-basis from ENU to its
+    # internal RFU (Right/Forward/Up) body frame:
     #   C_{ENU -> RFU} = R_y(R) * R_x(P) * R_z(-A)
-    # where each R_*(theta) is a passive rotation (basis change) about the named
-    # axis. span_link in the rest of the pipeline is FRD, so after recovering
-    # R_{ENU <- RFU} we apply the static RFU <-> FRD axis swap to return
-    # R_{ENU <- FRD}.
+    # The vehicle (base_link) frame in this project is FLU, so after recovering
+    # R_{ENU <- RFU} we apply the static RFU -> FLU swap (a 90 deg rotation
+    # about z) to produce R_{ENU <- FLU}. Downstream code consumes body points
+    # in vehicle FLU coords centered at the SPAN origin (see lidar_to_ie_body).
     roll = _deg2rad(roll_deg)
     pitch = _deg2rad(pitch_deg)
     neg_azimuth = -_deg2rad(heading_deg)
@@ -257,12 +257,13 @@ def rotation_matrix_from_ie(roll_deg: float, pitch_deg: float, heading_deg: floa
     )
     r_rfu_from_enu = ry_passive_R @ rx_passive_P @ rz_passive_negA
     r_enu_from_rfu = r_rfu_from_enu.T
-    # RFU (x=R, y=F, z=U) <-> FRD (x=F, y=R, z=D) is an involutive axis swap.
-    r_rfu_frd = np.array(
-        [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
+    # R_{RFU <- FLU}: vehicle FLU (x=F, y=L, z=U) expressed in CPT7 RFU axes.
+    # FLU x (Forward) -> RFU [0,1,0]; FLU y (Left) -> RFU [-1,0,0]; FLU z -> [0,0,1].
+    r_rfu_from_flu = np.array(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
-    return r_enu_from_rfu @ r_rfu_frd
+    return r_enu_from_rfu @ r_rfu_from_flu
 
 
 def _geodetic_to_ecef(lat_deg: float, lon_deg: float, h_m: float) -> np.ndarray:
@@ -417,18 +418,20 @@ def configure_span_lidar_extrinsics(lidar_config: dict[str, Any]) -> None:
 
 
 def lidar_to_ie_body(point_lidar: np.ndarray) -> np.ndarray:
-    # LiDAR FLU -> SPAN FLU -> SPAN/IE body FRD.
+    # Output: point in vehicle FLU axes, translated so the origin coincides with
+    # the SPAN/IE body origin. The intermediate `R_SPAN_FROM_LIDAR @ p + t`
+    # produces span FRD coords; the subsequent [x, -y, -z] converts FRD back
+    # to vehicle FLU while preserving the span-origin offset.
     p_l = np.asarray(point_lidar, dtype=np.float64).reshape(3)
-    p_span_flu = R_SPAN_FROM_LIDAR_ACTIVE @ p_l + T_SPAN_FROM_LIDAR_M_ACTIVE
-    # FLU -> FRD: x keeps, y/z flip sign.
-    return np.array([p_span_flu[0], -p_span_flu[1], -p_span_flu[2]], dtype=np.float64)
+    p_span_frd = R_SPAN_FROM_LIDAR_ACTIVE @ p_l + T_SPAN_FROM_LIDAR_M_ACTIVE
+    return np.array([p_span_frd[0], -p_span_frd[1], -p_span_frd[2]], dtype=np.float64)
 
 
 def ie_body_to_lidar(point_body: np.ndarray) -> np.ndarray:
-    # SPAN/IE body FRD -> SPAN FLU -> LiDAR FLU
-    p_body_frd = np.asarray(point_body, dtype=np.float64).reshape(3)
-    p_span_flu = np.array([p_body_frd[0], -p_body_frd[1], -p_body_frd[2]], dtype=np.float64)
-    return R_LIDAR_FROM_SPAN_ACTIVE @ p_span_flu + T_LIDAR_FROM_SPAN_M_ACTIVE
+    # Inverse of lidar_to_ie_body. Input is vehicle FLU centered at SPAN origin.
+    p_body_flu = np.asarray(point_body, dtype=np.float64).reshape(3)
+    p_span_frd = np.array([p_body_flu[0], -p_body_flu[1], -p_body_flu[2]], dtype=np.float64)
+    return R_LIDAR_FROM_SPAN_ACTIVE @ p_span_frd + T_LIDAR_FROM_SPAN_M_ACTIVE
 
 
 def ie_pose_to_enu(
