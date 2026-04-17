@@ -229,31 +229,40 @@ def _deg2rad(value_deg: float) -> float:
 
 
 def rotation_matrix_from_ie(roll_deg: float, pitch_deg: float, heading_deg: float) -> np.ndarray:
-    # IE/SPAN attitude is in local-level frame with NovAtel conventions:
-    # - azimuth/heading: clockwise from north around +Z (NED down axis)
-    # - pitch: right-handed rotation around x-axis
-    # - roll: right-handed rotation around y-axis
-    # Apply Z-X-Y sequence, then convert NED -> ENU.
-    yaw_ned_deg = float(heading_deg)
+    # SPAN CPT7 attitude output defines the change-of-basis from ENU to the
+    # vehicle RFU (Right/Forward/Up) frame:
+    #   C_{ENU -> RFU} = R_y(R) * R_x(P) * R_z(-A)
+    # where each R_*(theta) is a passive rotation (basis change) about the named
+    # axis. span_link in the rest of the pipeline is FRD, so after recovering
+    # R_{ENU <- RFU} we apply the static RFU <-> FRD axis swap to return
+    # R_{ENU <- FRD}.
     roll = _deg2rad(roll_deg)
     pitch = _deg2rad(pitch_deg)
-    yaw = _deg2rad(yaw_ned_deg)
-    cp, sp = math.cos(pitch), math.sin(pitch)
+    neg_azimuth = -_deg2rad(heading_deg)
     cr, sr = math.cos(roll), math.sin(roll)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    rx = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]], dtype=np.float64)
-    ry = np.array([[cr, 0.0, sr], [0.0, 1.0, 0.0], [-sr, 0.0, cr]], dtype=np.float64)
-    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-    r_ned_from_body = rz @ rx @ ry
-    r_enu_from_ned = np.array(
-        [
-            [0.0, 1.0, 0.0],   # E = +Y_ned
-            [1.0, 0.0, 0.0],   # N = +X_ned
-            [0.0, 0.0, -1.0],  # U = -Z_ned
-        ],
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cz, sz = math.cos(neg_azimuth), math.sin(neg_azimuth)
+    # Passive rotations (= active^T) matching the CPT7 formula.
+    ry_passive_R = np.array(
+        [[cr, 0.0, -sr], [0.0, 1.0, 0.0], [sr, 0.0, cr]],
         dtype=np.float64,
     )
-    return r_enu_from_ned @ r_ned_from_body
+    rx_passive_P = np.array(
+        [[1.0, 0.0, 0.0], [0.0, cp, sp], [0.0, -sp, cp]],
+        dtype=np.float64,
+    )
+    rz_passive_negA = np.array(
+        [[cz, sz, 0.0], [-sz, cz, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    r_rfu_from_enu = ry_passive_R @ rx_passive_P @ rz_passive_negA
+    r_enu_from_rfu = r_rfu_from_enu.T
+    # RFU (x=R, y=F, z=U) <-> FRD (x=F, y=R, z=D) is an involutive axis swap.
+    r_rfu_frd = np.array(
+        [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
+        dtype=np.float64,
+    )
+    return r_enu_from_rfu @ r_rfu_frd
 
 
 def _geodetic_to_ecef(lat_deg: float, lon_deg: float, h_m: float) -> np.ndarray:
