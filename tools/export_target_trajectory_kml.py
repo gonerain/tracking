@@ -3,7 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+import numpy as np
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +31,16 @@ def parse_args() -> argparse.Namespace:
         choices=["absolute", "clampToGround", "relativeToGround"],
         default="clampToGround",
         help="KML altitude mode.",
+    )
+    parser.add_argument(
+        "--lidar-config",
+        default="configs/lidar_config.yaml",
+        help="Lidar config path used when recomputing target positions from target_lidar_m.",
+    )
+    parser.add_argument(
+        "--recompute-target-from-lidar",
+        action="store_true",
+        help="Recompute target LLA from target_lidar_m and ie_pose instead of trusting stored target_world_lla.",
     )
     return parser.parse_args()
 
@@ -123,6 +141,67 @@ def load_synced_target_span_points(
     return target_rows, span_rows
 
 
+def load_synced_target_span_points_recomputed(
+    path: Path,
+    lidar_config_path: Path,
+) -> tuple[list[tuple[float, float, float, float]], list[tuple[float, float, float, float]]]:
+    from core import fusion_tracking as ft
+
+    if not path.exists():
+        raise FileNotFoundError(f"Input file not found: {path}")
+    if not lidar_config_path.exists():
+        raise FileNotFoundError(f"Lidar config not found: {lidar_config_path}")
+
+    lidar_config = yaml.safe_load(lidar_config_path.read_text(encoding="utf-8"))
+    ft.configure_span_lidar_extrinsics(lidar_config)
+
+    target_rows: list[tuple[float, float, float, float]] = []
+    span_rows: list[tuple[float, float, float, float]] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = item.get("timestamp")
+        pose = item.get("ie_pose")
+        target_lidar = item.get("target_lidar_m")
+        if ts is None or not isinstance(pose, dict):
+            continue
+        try:
+            t = float(ts)
+            s_lat = float(pose["latitude_deg"])
+            s_lon = float(pose["longitude_deg"])
+            s_alt = float(pose["height_m"])
+            roll_deg = float(pose["roll_deg"])
+            pitch_deg = float(pose["pitch_deg"])
+            heading_deg = float(pose["heading_deg"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        span_rows.append((t, s_lon, s_lat, s_alt))
+        if not isinstance(target_lidar, list) or len(target_lidar) < 3:
+            continue
+        try:
+            target_lidar_vec = np.asarray(target_lidar[:3], dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+
+        target_body = ft.lidar_to_ie_body(target_lidar_vec)
+        rot_enu_from_body = ft.rotation_matrix_from_ie(
+            roll_deg=roll_deg,
+            pitch_deg=pitch_deg,
+            heading_deg=heading_deg,
+        )
+        span_ecef = ft._geodetic_to_ecef(s_lat, s_lon, s_alt)
+        enu_to_ecef = ft._enu_to_ecef_matrix(s_lat, s_lon)
+        target_ecef = span_ecef + enu_to_ecef @ (rot_enu_from_body @ target_body)
+        t_lat, t_lon, t_alt = ft._ecef_to_geodetic(target_ecef)
+        target_rows.append((t, t_lon, t_lat, t_alt))
+    return target_rows, span_rows
+
+
 def write_kml(
     target_points: list[tuple[float, float, float, float]],
     span_points: list[tuple[float, float, float, float]],
@@ -215,7 +294,13 @@ def main() -> None:
     args = parse_args()
     input_path = Path(str(args.input))
     output_path = Path(str(args.output))
-    target_points, span_points = load_synced_target_span_points(input_path)
+    if args.recompute_target_from_lidar:
+        target_points, span_points = load_synced_target_span_points_recomputed(
+            input_path,
+            Path(str(args.lidar_config)),
+        )
+    else:
+        target_points, span_points = load_synced_target_span_points(input_path)
     if len(target_points) < 2 or len(span_points) < 2:
         # Fallback to independent trajectories only when synced records are too few.
         target_points = load_target_lla_points(input_path)

@@ -74,7 +74,7 @@ ie_lidar_extrinsics:
       - [-0.4226, 0.0, 0.9063]
     translation_m: [0.0315, 0.0, 0.1314]
   base_to_span:
-    # T_base<-span (FLU), from Extrinsics.pdf base_link_to_span_link
+    # T_base<-span (FRD), from Extrinsics.pdf base_link_to_span_link
     rotation_3x3:
       - [1.0, 0.0, 0.0]
       - [0.0, -1.0, 0.0]
