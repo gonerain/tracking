@@ -6,7 +6,7 @@ input:
     height: 1024
     fps: 10
   rosbag:
-    bag_path: data/2026-04-14_mongkok-opensky-walk-006/rosbag/segment_2026-04-14-17-32-00_3.bag
+    bag_path: data/2026-04-14_mongkok-opensky-walk-006/rosbag/segment_2026-04-14-17-31-17_2.bag
     topic: /front_camera/image/compressed
     start_time_s: 0.0
     end_time_s: null

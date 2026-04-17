@@ -1,6 +1,6 @@
 input:
   rosbag:
-    bag_path: data/2026-04-14_mongkok-opensky-walk-006/rosbag/segment_2026-04-14-17-32-00_3.bag
+    bag_path: data/2026-04-14_mongkok-opensky-walk-006/rosbag/segment_2026-04-14-17-31-17_2.bag
     topic: /lidar
     start_time_s: null
     end_time_s: null
@@ -25,6 +25,7 @@ roi:
     expanded_z_max_offset_m: 2.0
     recovery_trigger_frames: 2
     recovery_disable_frames: 4
+    min_points_after_crop: 180
 
 ego_vehicle_filter:
   enabled: true
@@ -37,20 +38,53 @@ ground_removal:
   z_min: 0.12
   z_max: 3.0
   cell_size_m: 0.45
-  ground_quantile: 0.18
-  clearance_m: 0.10
+  ground_quantile: 0.12
+  clearance_m: 0.07
   min_points_per_cell: 6
-  fallback_clearance_m: 0.16
+  fallback_clearance_m: 0.11
+  protect_radius_m: 0.35
+  protect_z_margin_m: 0.7
+  track_protect_radius_m: 0.4
+  track_protect_z_margin_m: 0.8
+  aruco_protect_radius_m: 0.35
+  aruco_protect_z_margin_m: 0.75
 
 clustering:
   tolerance_m: 0.45
   min_cluster_points: 6
   max_cluster_points: 5000
+  merge_xy_distance_m: 0.55
+  merge_z_gap_m: 0.9
+  merge_max_points: 8000
+
+temporal_fusion:
+  enabled: true
+  half_window_frames: 1
+  max_time_span_s: 0.25
+  motion_compensation_with_ie: true
+  voxel_size_m: 0.06
+  max_points_after_fusion: 20000
+
+ie_lidar_extrinsics:
+  base_from_lidar:
+    # T_base<-lidar (FLU), from GeoScanS2 TF drawing
+    rotation_3x3:
+      - [0.9063, 0.0, 0.4226]
+      - [0.0, 1.0, 0.0]
+      - [-0.4226, 0.0, 0.9063]
+    translation_m: [0.0315, 0.0, 0.1314]
+  base_to_span:
+    # T_base<-span (FLU), from Extrinsics.pdf base_link_to_span_link
+    rotation_3x3:
+      - [1.0, 0.0, 0.0]
+      - [0.0, -1.0, 0.0]
+      - [0.0, 0.0, -1.0]
+    translation_m: [-0.2684, -0.082, -0.1527]
 
 detector:
   enabled: true
-  # cluster | centerpoint | hybrid
-  source: hybrid
+  # cluster | centerpoint | hybrid | aruco_mask_v2
+  source: aruco_mask_v2
   dedup_distance_m: 0.4
   centerpoint:
     # none | mmdet3d | python_module
@@ -90,22 +124,23 @@ tracker:
   forget_misses: 8
   quality_hit_gain: 0.22
   quality_miss_decay: 0.86
-  aruco_gate_sigma_m: 0.75
-  aruco_hard_gate_multiplier: 1.8
-  aruco_min_combined_score: 0.08
+  aruco_gate_sigma_m: 0.95
+  aruco_hard_gate_multiplier: 2.2
+  aruco_min_combined_score: 0.03
   aruco_motion_sigma_floor_m: 0.5
+  aruco_observed_relax_motion: true
   max_footpoint_z_m: 0.8
-  max_footpoint_z_with_aruco_m: 1.2
+  max_footpoint_z_with_aruco_m: 1.5
   max_planar_jump_m: 1.0
-  max_planar_jump_with_aruco_m: 1.4
+  max_planar_jump_with_aruco_m: 2.2
   max_vertical_jump_m: 0.6
   max_planar_speed_mps: 3.5
-  max_planar_speed_with_aruco_mps: 5.0
+  max_planar_speed_with_aruco_mps: 6.5
   max_vertical_speed_mps: 2.5
   reconnect_relax_after_frames: 2
   reconnect_max_footpoint_z_m: 1.4
-  reconnect_max_planar_jump_m: 2.8
-  reconnect_max_planar_speed_mps: 6.0
+  reconnect_max_planar_jump_m: 3.8
+  reconnect_max_planar_speed_mps: 7.0
   rescue_max_footpoint_z_m: 1.4
   rescue_max_planar_jump_m: 2.0
   rescue_max_distance_to_aruco_m: 1.5
@@ -114,7 +149,7 @@ tracker:
   near_aruco_bypass_planar_jump: true
   near_aruco_max_planar_jump_m: 2.6
   near_aruco_max_planar_speed_mps: 7.0
-  hold_without_match_duration_s: 0.4
+  hold_without_match_duration_s: 0.8
 
 logging:
   output_json: outputs/lidar_tracking_log.json
@@ -131,7 +166,7 @@ segmentation:
   config_path: imseg/mask2former/config/swin/maskformer2_swin_large_IN21k_384_coco_instance_100ep.yaml
   model_path: imseg/mask2former/model/mask2former_swin_large_coco_instance_100ep.pkl
   person_class_id: 0
-  min_person_mask_area_px: 8000
+  min_person_mask_area_px: 5000
   max_instances_considered: 5
   candidate_dedup_distance_m: 0.2
   camera_config: configs/aruco_config.yaml

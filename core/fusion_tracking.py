@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import importlib.util
 import json
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,10 +22,12 @@ from core.lidar_tracking import (
     RosbagLidarSource,
     SimpleTracker,
     TrackState,
+    compute_candidate,
     crop_points,
     euclidean_clusters,
     filter_candidates,
     format_candidate,
+    merge_vertical_person_clusters,
     remove_ego_vehicle_points,
     remove_ground,
     render_debug_image,
@@ -55,6 +59,464 @@ class ArucoDebugState:
     target_person_mask: np.ndarray | None
     selected_person_masks: list[np.ndarray]
     raw_person_mask_count: int
+
+
+def build_ground_protect_regions(
+    tracker: SimpleTracker,
+    aruco_prior: ArucoPrior | None,
+    ground_cfg: dict[str, Any],
+) -> list[dict[str, float]]:
+    regions: list[dict[str, float]] = []
+    if tracker.last_state is not None and tracker.track_lifecycle != "lost":
+        pos = tracker.last_state.position
+        regions.append(
+            {
+                "x": float(pos[0]),
+                "y": float(pos[1]),
+                "z": float(pos[2]),
+                "radius_m": float(ground_cfg.get("track_protect_radius_m", 0.4)),
+                "z_margin_m": float(ground_cfg.get("track_protect_z_margin_m", 0.8)),
+            }
+        )
+    if aruco_prior is not None and bool(aruco_prior.visible):
+        pos = aruco_prior.position_lidar
+        regions.append(
+            {
+                "x": float(pos[0]),
+                "y": float(pos[1]),
+                "z": float(pos[2]),
+                "radius_m": float(ground_cfg.get("aruco_protect_radius_m", 0.35)),
+                "z_margin_m": float(ground_cfg.get("aruco_protect_z_margin_m", 0.75)),
+            }
+        )
+    return regions
+
+
+@dataclass
+class IePose:
+    timestamp: float
+    latitude_deg: float
+    longitude_deg: float
+    height_m: float
+    roll_deg: float
+    pitch_deg: float
+    heading_deg: float
+
+
+class TargetWorldWriter:
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.records: list[dict[str, Any]] = []
+
+    def append(self, record: dict[str, Any]) -> None:
+        self.records.append(record)
+        self.flush()
+
+    def flush(self) -> None:
+        payload = "\n".join(json.dumps(item, ensure_ascii=False) for item in self.records)
+        if payload:
+            payload += "\n"
+        self.output_path.write_text(payload, encoding="utf-8")
+
+
+def _dms_to_deg(deg_token: str, minute_token: str, second_token: str) -> float:
+    deg = float(deg_token)
+    minute = float(minute_token)
+    second = float(second_token)
+    sign = -1.0 if deg < 0 else 1.0
+    return sign * (abs(deg) + minute / 60.0 + second / 3600.0)
+
+
+def load_ie_poses(ie_path: Path) -> list[IePose]:
+    if not ie_path.exists():
+        return []
+    poses: list[IePose] = []
+    for raw_line in ie_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or not re.match(r"^[0-9]", line):
+            continue
+        parts = line.split()
+        # Example:
+        # ts week gps latD latM latS lonD lonM lonS h ... roll pitch heading Q
+        if len(parts) < 18:
+            continue
+        try:
+            timestamp = float(parts[0])
+            lat_deg = _dms_to_deg(parts[3], parts[4], parts[5])
+            lon_deg = _dms_to_deg(parts[6], parts[7], parts[8])
+            height_m = float(parts[9])
+            roll_deg = float(parts[-4])
+            pitch_deg = float(parts[-3])
+            heading_deg = float(parts[-2])
+        except ValueError:
+            continue
+        poses.append(
+            IePose(
+                timestamp=timestamp,
+                latitude_deg=lat_deg,
+                longitude_deg=lon_deg,
+                height_m=height_m,
+                roll_deg=roll_deg,
+                pitch_deg=pitch_deg,
+                heading_deg=heading_deg,
+            )
+        )
+    poses.sort(key=lambda item: item.timestamp)
+    return poses
+
+
+class IePoseProvider:
+    def __init__(self, poses: list[IePose]) -> None:
+        self.poses = poses
+        self._timestamps = [pose.timestamp for pose in poses]
+
+    @property
+    def available(self) -> bool:
+        return bool(self.poses)
+
+    def get_nearest(self, timestamp: float) -> IePose | None:
+        if not self.poses:
+            return None
+        right_index = bisect.bisect_right(self._timestamps, float(timestamp))
+        current_index = max(0, min(len(self.poses) - 1, right_index - 1))
+        current = self.poses[current_index]
+        if current_index + 1 < len(self.poses):
+            nxt = self.poses[current_index + 1]
+            if abs(nxt.timestamp - timestamp) < abs(current.timestamp - timestamp):
+                return nxt
+        return current
+
+    @staticmethod
+    def _lerp(a: float, b: float, alpha: float) -> float:
+        return float(a) + (float(b) - float(a)) * float(alpha)
+
+    @staticmethod
+    def _lerp_angle_deg(a_deg: float, b_deg: float, alpha: float) -> float:
+        # Interpolate with shortest angular path.
+        a = float(a_deg)
+        b = float(b_deg)
+        delta = (b - a + 180.0) % 360.0 - 180.0
+        return a + delta * float(alpha)
+
+    def get_interpolated(self, timestamp: float) -> IePose | None:
+        if not self.poses:
+            return None
+        right_index = bisect.bisect_right(self._timestamps, float(timestamp))
+        left_index = max(0, min(len(self.poses) - 1, right_index - 1))
+        left = self.poses[left_index]
+        if left_index + 1 >= len(self.poses):
+            return left
+        right = self.poses[left_index + 1]
+        dt = float(right.timestamp - left.timestamp)
+        if dt <= 1e-9:
+            return left
+        alpha = float(timestamp - left.timestamp) / dt
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        return IePose(
+            timestamp=float(timestamp),
+            latitude_deg=self._lerp(left.latitude_deg, right.latitude_deg, alpha),
+            longitude_deg=self._lerp(left.longitude_deg, right.longitude_deg, alpha),
+            height_m=self._lerp(left.height_m, right.height_m, alpha),
+            roll_deg=self._lerp_angle_deg(left.roll_deg, right.roll_deg, alpha),
+            pitch_deg=self._lerp_angle_deg(left.pitch_deg, right.pitch_deg, alpha),
+            heading_deg=self._lerp_angle_deg(left.heading_deg, right.heading_deg, alpha),
+        )
+
+
+def _deg2rad(value_deg: float) -> float:
+    return float(value_deg) * math.pi / 180.0
+
+
+def rotation_matrix_from_ie(roll_deg: float, pitch_deg: float, heading_deg: float) -> np.ndarray:
+    # IE/SPAN attitude is in local-level frame with NovAtel conventions:
+    # - azimuth/heading: clockwise from north around +Z (NED down axis)
+    # - pitch: right-handed rotation around x-axis
+    # - roll: right-handed rotation around y-axis
+    # Apply Z-X-Y sequence, then convert NED -> ENU.
+    yaw_ned_deg = float(heading_deg)
+    roll = _deg2rad(roll_deg)
+    pitch = _deg2rad(pitch_deg)
+    yaw = _deg2rad(yaw_ned_deg)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cr, sr = math.cos(roll), math.sin(roll)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]], dtype=np.float64)
+    ry = np.array([[cr, 0.0, sr], [0.0, 1.0, 0.0], [-sr, 0.0, cr]], dtype=np.float64)
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    r_ned_from_body = rz @ rx @ ry
+    r_enu_from_ned = np.array(
+        [
+            [0.0, 1.0, 0.0],   # E = +Y_ned
+            [1.0, 0.0, 0.0],   # N = +X_ned
+            [0.0, 0.0, -1.0],  # U = -Z_ned
+        ],
+        dtype=np.float64,
+    )
+    return r_enu_from_ned @ r_ned_from_body
+
+
+def _geodetic_to_ecef(lat_deg: float, lon_deg: float, h_m: float) -> np.ndarray:
+    # WGS84
+    a = 6378137.0
+    e2 = 6.69437999014e-3
+    lat = _deg2rad(lat_deg)
+    lon = _deg2rad(lon_deg)
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    sin_lon = math.sin(lon)
+    cos_lon = math.cos(lon)
+    n = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
+    x = (n + h_m) * cos_lat * cos_lon
+    y = (n + h_m) * cos_lat * sin_lon
+    z = (n * (1.0 - e2) + h_m) * sin_lat
+    return np.array([x, y, z], dtype=np.float64)
+
+
+def _ecef_to_enu_matrix(lat_deg: float, lon_deg: float) -> np.ndarray:
+    lat = _deg2rad(lat_deg)
+    lon = _deg2rad(lon_deg)
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    sin_lon = math.sin(lon)
+    cos_lon = math.cos(lon)
+    return np.array(
+        [
+            [-sin_lon, cos_lon, 0.0],
+            [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat],
+            [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _enu_to_ecef_matrix(lat_deg: float, lon_deg: float) -> np.ndarray:
+    return _ecef_to_enu_matrix(lat_deg, lon_deg).T
+
+
+def _ecef_to_geodetic(ecef_xyz: np.ndarray) -> tuple[float, float, float]:
+    # Bowring iterative solution, WGS84.
+    a = 6378137.0
+    e2 = 6.69437999014e-3
+    x, y, z = float(ecef_xyz[0]), float(ecef_xyz[1]), float(ecef_xyz[2])
+    lon = math.atan2(y, x)
+    p = math.hypot(x, y)
+    lat = math.atan2(z, p * (1.0 - e2))
+    for _ in range(6):
+        sin_lat = math.sin(lat)
+        n = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
+        lat = math.atan2(z + e2 * n * sin_lat, p)
+    sin_lat = math.sin(lat)
+    n = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
+    h = p / max(math.cos(lat), 1e-12) - n
+    return lat * 180.0 / math.pi, lon * 180.0 / math.pi, h
+
+
+# Measured extrinsics (FLU convention):
+# T_base<-lidar from CAD TF:
+# R =
+# [[ 0.9063, 0.0,  0.4226],
+#  [ 0.0,    1.0,  0.0   ],
+#  [-0.4226, 0.0,  0.9063]]
+# t = [31.5, 0.0, 131.4] mm
+R_BASE_FROM_LIDAR = np.array(
+    [
+        [0.9063, 0.0, 0.4226],
+        [0.0, 1.0, 0.0],
+        [-0.4226, 0.0, 0.9063],
+    ],
+    dtype=np.float64,
+)
+T_BASE_FROM_LIDAR_M = np.array([0.0315, 0.0, 0.1314], dtype=np.float64)
+
+# T_base<-span from extrinsics document (base_link_to_span_link).
+R_BASE_FROM_SPAN = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ],
+    dtype=np.float64,
+)
+T_BASE_FROM_SPAN_M = np.array([-0.2684, -0.0820, -0.1527], dtype=np.float64)
+
+# Inverse to obtain T_span<-base
+R_SPAN_FROM_BASE = R_BASE_FROM_SPAN.T
+T_SPAN_FROM_BASE_M = -R_SPAN_FROM_BASE @ T_BASE_FROM_SPAN_M
+
+# Compose T_span<-lidar = T_span<-base * T_base<-lidar
+R_SPAN_FROM_LIDAR = R_SPAN_FROM_BASE @ R_BASE_FROM_LIDAR
+T_SPAN_FROM_LIDAR_M = R_SPAN_FROM_BASE @ T_BASE_FROM_LIDAR_M + T_SPAN_FROM_BASE_M
+
+# Inverse to obtain T_lidar<-span
+R_LIDAR_FROM_SPAN = R_SPAN_FROM_LIDAR.T
+T_LIDAR_FROM_SPAN_M = -R_LIDAR_FROM_SPAN @ T_SPAN_FROM_LIDAR_M
+
+# Active extrinsics (can be overridden by config at runtime)
+R_SPAN_FROM_LIDAR_ACTIVE = R_SPAN_FROM_LIDAR.copy()
+T_SPAN_FROM_LIDAR_M_ACTIVE = T_SPAN_FROM_LIDAR_M.copy()
+R_LIDAR_FROM_SPAN_ACTIVE = R_LIDAR_FROM_SPAN.copy()
+T_LIDAR_FROM_SPAN_M_ACTIVE = T_LIDAR_FROM_SPAN_M.copy()
+
+
+def _as_3x3_matrix(value: Any, default: np.ndarray) -> np.ndarray:
+    try:
+        arr = np.asarray(value, dtype=np.float64).reshape(3, 3)
+        return arr
+    except Exception:
+        return default
+
+
+def _as_3_vector(value: Any, default: np.ndarray) -> np.ndarray:
+    try:
+        arr = np.asarray(value, dtype=np.float64).reshape(3)
+        return arr
+    except Exception:
+        return default
+
+
+def configure_span_lidar_extrinsics(lidar_config: dict[str, Any]) -> None:
+    cfg = dict(lidar_config.get("ie_lidar_extrinsics", {}))
+    base_from_lidar = dict(cfg.get("base_from_lidar", {}))
+    # Prefer base_to_span (T_base<-span), keep span_from_base as legacy fallback.
+    base_to_span = dict(cfg.get("base_to_span", {}))
+    span_from_base_legacy = dict(cfg.get("span_from_base", {}))
+
+    r_base_from_lidar = _as_3x3_matrix(base_from_lidar.get("rotation_3x3", R_BASE_FROM_LIDAR), R_BASE_FROM_LIDAR)
+    t_base_from_lidar = _as_3_vector(base_from_lidar.get("translation_m", T_BASE_FROM_LIDAR_M), T_BASE_FROM_LIDAR_M)
+    if base_to_span:
+        r_base_from_span = _as_3x3_matrix(base_to_span.get("rotation_3x3", R_BASE_FROM_SPAN), R_BASE_FROM_SPAN)
+        t_base_from_span = _as_3_vector(base_to_span.get("translation_m", T_BASE_FROM_SPAN_M), T_BASE_FROM_SPAN_M)
+        r_span_from_base = r_base_from_span.T
+        t_span_from_base = -r_span_from_base @ t_base_from_span
+    else:
+        # Backward compatibility: interpret legacy key directly as T_span<-base.
+        r_span_from_base = _as_3x3_matrix(span_from_base_legacy.get("rotation_3x3", R_SPAN_FROM_BASE), R_SPAN_FROM_BASE)
+        t_span_from_base = _as_3_vector(span_from_base_legacy.get("translation_m", T_SPAN_FROM_BASE_M), T_SPAN_FROM_BASE_M)
+
+    r_span_from_lidar = r_span_from_base @ r_base_from_lidar
+    t_span_from_lidar = r_span_from_base @ t_base_from_lidar + t_span_from_base
+    r_lidar_from_span = r_span_from_lidar.T
+    t_lidar_from_span = -r_lidar_from_span @ t_span_from_lidar
+
+    global R_SPAN_FROM_LIDAR_ACTIVE, T_SPAN_FROM_LIDAR_M_ACTIVE
+    global R_LIDAR_FROM_SPAN_ACTIVE, T_LIDAR_FROM_SPAN_M_ACTIVE
+    R_SPAN_FROM_LIDAR_ACTIVE = r_span_from_lidar
+    T_SPAN_FROM_LIDAR_M_ACTIVE = t_span_from_lidar
+    R_LIDAR_FROM_SPAN_ACTIVE = r_lidar_from_span
+    T_LIDAR_FROM_SPAN_M_ACTIVE = t_lidar_from_span
+
+
+def lidar_to_ie_body(point_lidar: np.ndarray) -> np.ndarray:
+    # LiDAR FLU -> SPAN FLU -> SPAN/IE body FRD.
+    p_l = np.asarray(point_lidar, dtype=np.float64).reshape(3)
+    p_span_flu = R_SPAN_FROM_LIDAR_ACTIVE @ p_l + T_SPAN_FROM_LIDAR_M_ACTIVE
+    # FLU -> FRD: x keeps, y/z flip sign.
+    return np.array([p_span_flu[0], -p_span_flu[1], -p_span_flu[2]], dtype=np.float64)
+
+
+def ie_body_to_lidar(point_body: np.ndarray) -> np.ndarray:
+    # SPAN/IE body FRD -> SPAN FLU -> LiDAR FLU
+    p_body_frd = np.asarray(point_body, dtype=np.float64).reshape(3)
+    p_span_flu = np.array([p_body_frd[0], -p_body_frd[1], -p_body_frd[2]], dtype=np.float64)
+    return R_LIDAR_FROM_SPAN_ACTIVE @ p_span_flu + T_LIDAR_FROM_SPAN_M_ACTIVE
+
+
+def ie_pose_to_enu(
+    pose: IePose,
+    ecef_origin: np.ndarray,
+    enu_from_ecef: np.ndarray,
+) -> np.ndarray:
+    ecef = _geodetic_to_ecef(pose.latitude_deg, pose.longitude_deg, pose.height_m)
+    return enu_from_ecef @ (ecef - ecef_origin)
+
+
+def transform_points_lidar_between_ie_poses(
+    points_lidar: np.ndarray,
+    src_pose: IePose,
+    dst_pose: IePose,
+    ecef_origin: np.ndarray,
+    enu_from_ecef: np.ndarray,
+) -> np.ndarray:
+    if points_lidar.size == 0:
+        return points_lidar
+    src_enu = ie_pose_to_enu(src_pose, ecef_origin, enu_from_ecef)
+    dst_enu = ie_pose_to_enu(dst_pose, ecef_origin, enu_from_ecef)
+    src_rot = rotation_matrix_from_ie(src_pose.roll_deg, src_pose.pitch_deg, src_pose.heading_deg)
+    dst_rot = rotation_matrix_from_ie(dst_pose.roll_deg, dst_pose.pitch_deg, dst_pose.heading_deg)
+
+    pts_body_src = np.asarray([lidar_to_ie_body(point) for point in points_lidar], dtype=np.float64)
+    pts_world = pts_body_src @ src_rot.T + src_enu.reshape(1, 3)
+    pts_body_dst = (pts_world - dst_enu.reshape(1, 3)) @ dst_rot
+    pts_lidar_dst = np.asarray([ie_body_to_lidar(point) for point in pts_body_dst], dtype=np.float64)
+    return pts_lidar_dst.astype(np.float64)
+
+
+def voxel_downsample(points: np.ndarray, voxel_size_m: float) -> np.ndarray:
+    if points.size == 0 or voxel_size_m <= 0.0:
+        return points
+    grid = np.floor(points / float(voxel_size_m)).astype(np.int32)
+    _, unique_indices = np.unique(grid, axis=0, return_index=True)
+    unique_indices = np.sort(unique_indices)
+    return points[unique_indices]
+
+
+def temporal_fuse_points(
+    frame_index: int,
+    points_per_frame: list[np.ndarray],
+    timestamps: list[float],
+    temporal_cfg: dict[str, Any],
+    ie_poses_per_frame: list[IePose | None],
+    ecef_origin: np.ndarray | None,
+    enu_from_ecef: np.ndarray | None,
+) -> np.ndarray:
+    if frame_index < 0 or frame_index >= len(points_per_frame):
+        return np.empty((0, 3), dtype=np.float64)
+    base_points = points_per_frame[frame_index]
+    if not bool(temporal_cfg.get("enabled", False)):
+        return base_points
+
+    half_window = max(int(temporal_cfg.get("half_window_frames", 1)), 0)
+    if half_window <= 0:
+        return base_points
+    max_time_span_s = float(temporal_cfg.get("max_time_span_s", 0.25))
+    use_motion_comp = bool(temporal_cfg.get("motion_compensation_with_ie", True))
+
+    center_ts = float(timestamps[frame_index])
+    center_pose = ie_poses_per_frame[frame_index]
+    chunks: list[np.ndarray] = []
+    for neighbor_index in range(max(0, frame_index - half_window), min(len(points_per_frame), frame_index + half_window + 1)):
+        pts = points_per_frame[neighbor_index]
+        if pts.size == 0:
+            continue
+        dt = abs(float(timestamps[neighbor_index] - center_ts))
+        if dt > max_time_span_s:
+            continue
+        if (
+            use_motion_comp
+            and neighbor_index != frame_index
+            and center_pose is not None
+            and ie_poses_per_frame[neighbor_index] is not None
+            and ecef_origin is not None
+            and enu_from_ecef is not None
+        ):
+            pts = transform_points_lidar_between_ie_poses(
+                points_lidar=pts,
+                src_pose=ie_poses_per_frame[neighbor_index],
+                dst_pose=center_pose,
+                ecef_origin=ecef_origin,
+                enu_from_ecef=enu_from_ecef,
+            )
+        chunks.append(pts)
+    if not chunks:
+        return base_points
+    fused = np.concatenate(chunks, axis=0)
+    fused = voxel_downsample(fused, float(temporal_cfg.get("voxel_size_m", 0.06)))
+    max_points = int(temporal_cfg.get("max_points_after_fusion", 20000))
+    if max_points > 0 and fused.shape[0] > max_points:
+        sample_indices = np.linspace(0, fused.shape[0] - 1, num=max_points, dtype=np.int32)
+        fused = fused[sample_indices]
+    return fused
 
 
 class CenterPointCandidateProvider:
@@ -669,6 +1131,16 @@ def parse_args() -> argparse.Namespace:
         default="outputs/fusion_tracking_log.json",
         help="Path to fused tracking JSON output.",
     )
+    parser.add_argument(
+        "--ie-path",
+        default="data/2026-04-14_mongkok-opensky-walk-006/raw/novatel/ie/ie.txt",
+        help="Path to IE/SPAN text file for world-frame lidar pose.",
+    )
+    parser.add_argument(
+        "--output-target-world-json",
+        default="outputs/target_world_positions.jsonl",
+        help="Path to per-frame world target position JSONL output.",
+    )
     return parser.parse_args()
 
 
@@ -788,6 +1260,34 @@ def build_aruco_rescue_candidates(
     ]
 
 
+def build_target_mask_v2_candidates(
+    segmented_clusters: list[np.ndarray],
+    person_cfg: dict[str, Any],
+) -> list[ClusterCandidate]:
+    if not segmented_clusters:
+        return []
+
+    relaxed_cfg = dict(person_cfg)
+    if "min_points_with_aruco" in person_cfg:
+        relaxed_cfg["min_points"] = int(person_cfg["min_points_with_aruco"])
+    if "height_m_with_aruco" in person_cfg:
+        relaxed_cfg["height_m"] = person_cfg["height_m_with_aruco"]
+    if "width_m_with_aruco" in person_cfg:
+        relaxed_cfg["width_m"] = person_cfg["width_m_with_aruco"]
+    if "depth_m_with_aruco" in person_cfg:
+        relaxed_cfg["depth_m"] = person_cfg["depth_m_with_aruco"]
+
+    candidates = filter_candidates(segmented_clusters, relaxed_cfg)
+    if candidates:
+        return candidates
+
+    largest = max(segmented_clusters, key=lambda cluster: int(cluster.shape[0]))
+    min_points = int(relaxed_cfg.get("min_points", 3))
+    if int(largest.shape[0]) < max(min_points, 3):
+        return []
+    return [compute_candidate(cluster_id=0, cluster=largest)]
+
+
 def candidate_key(candidate: ClusterCandidate) -> str:
     foot = np.round(candidate.footpoint, 3).tolist()
     size = np.round(candidate.size, 3).tolist()
@@ -801,6 +1301,12 @@ def candidate_motion_reject_reason(
     tracker_cfg: dict[str, Any],
     aruco_prior: ArucoPrior | None = None,
 ) -> str | None:
+    aruco_observed = (
+        aruco_prior is not None
+        and bool(aruco_prior.visible)
+        and str(aruco_prior.source).lower() == "observed"
+    )
+    relax_motion_with_aruco_observed = bool(tracker_cfg.get("aruco_observed_relax_motion", True))
     distance_to_aruco_m = None
     if aruco_prior is not None:
         distance_to_aruco_m = float(np.linalg.norm(candidate.footpoint[:2] - aruco_prior.position_lidar[:2]))
@@ -817,6 +1323,11 @@ def candidate_motion_reject_reason(
     footpoint_z = float(candidate.footpoint[2])
     if footpoint_z > max_footpoint_z_m:
         return f"footpoint_z>{max_footpoint_z_m:.2f}"
+
+    # With observed ArUco prior, trust ROI+prior association first and
+    # do not hard-reject by motion continuity (common during re-acquisition).
+    if aruco_observed and relax_motion_with_aruco_observed:
+        return None
 
     if last_state is None:
         return None
@@ -875,6 +1386,11 @@ def build_motion_cfg(
     is_rescue_candidate: bool,
 ) -> dict[str, Any]:
     cfg = dict(tracker_cfg)
+    aruco_observed = (
+        aruco_prior is not None
+        and bool(aruco_prior.visible)
+        and str(aruco_prior.source).lower() == "observed"
+    )
     if aruco_prior is not None:
         if "max_footpoint_z_with_aruco_m" in tracker_cfg:
             cfg["max_footpoint_z_m"] = float(tracker_cfg["max_footpoint_z_with_aruco_m"])
@@ -888,6 +1404,8 @@ def build_motion_cfg(
             cfg["max_planar_jump_m"] = float(tracker_cfg.get("reconnect_max_planar_jump_m", cfg.get("max_planar_jump_m", 1.4)))
             cfg["max_planar_speed_mps"] = float(tracker_cfg.get("reconnect_max_planar_speed_mps", cfg.get("max_planar_speed_mps", 5.0)))
             cfg["max_footpoint_z_m"] = float(tracker_cfg.get("reconnect_max_footpoint_z_m", cfg.get("max_footpoint_z_m", 1.2)))
+    if aruco_observed:
+        cfg["aruco_observed_relax_motion"] = bool(tracker_cfg.get("aruco_observed_relax_motion", True))
 
     if is_rescue_candidate and aruco_prior is not None:
         cfg["max_footpoint_z_m"] = float(tracker_cfg.get("rescue_max_footpoint_z_m", cfg.get("max_footpoint_z_m", 1.4)))
@@ -971,7 +1489,12 @@ def apply_aruco_local_roi(
         & (points[:, 2] >= center[2] + z_min_offset)
         & (points[:, 2] <= center[2] + z_max_offset)
     )
-    return points[mask]
+    cropped = points[mask]
+    min_points_keep = int(local_cfg.get("min_points_after_crop", 180))
+    if cropped.shape[0] < min_points_keep:
+        # Avoid over-cropping: keep original points if local ROI becomes too sparse.
+        return points
+    return cropped
 
 
 def format_fusion_record(
@@ -1065,6 +1588,7 @@ def main() -> None:
     args = parse_args()
     aruco_config = load_aruco_config(args.aruco_config)
     lidar_config = load_aruco_config(args.lidar_config)
+    configure_span_lidar_extrinsics(lidar_config)
     aruco_runtime_config = dict(aruco_config)
     aruco_runtime_config["segmentation"] = dict(lidar_config.get("segmentation", {}))
     aruco_runtime_config["sync"] = dict(lidar_config.get("sync", {}))
@@ -1075,6 +1599,7 @@ def main() -> None:
     clustering_cfg = lidar_config["clustering"]
     tracker_cfg = lidar_config["tracker"]
     logging_cfg = lidar_config.get("logging", {})
+    temporal_cfg = lidar_config.get("temporal_fusion", {})
 
     tracker = SimpleTracker(
         gating_distance_m=float(tracker_cfg.get("gating_distance_m", 1.0)),
@@ -1102,27 +1627,60 @@ def main() -> None:
         output_path=Path(str(args.output_json)),
         flush_every_frame=bool(logging_cfg.get("flush_every_frame", True)),
     )
+    ie_pose_provider = IePoseProvider(load_ie_poses(Path(str(args.ie_path))))
+    target_world_writer = TargetWorldWriter(Path(str(args.output_target_world_json)))
+    enu_origin_pose = ie_pose_provider.poses[0] if ie_pose_provider.available else None
+    ecef_origin = None if enu_origin_pose is None else _geodetic_to_ecef(
+        enu_origin_pose.latitude_deg,
+        enu_origin_pose.longitude_deg,
+        enu_origin_pose.height_m,
+    )
+    enu_from_ecef = None if enu_origin_pose is None else _ecef_to_enu_matrix(
+        enu_origin_pose.latitude_deg,
+        enu_origin_pose.longitude_deg,
+    )
 
     frame_index = 0
     interrupted = False
     reconnect_streak = 0
     local_roi_recovery_countdown = 0
 
+    raw_points_per_frame: list[np.ndarray] = []
+    timestamps: list[float] = []
+    while True:
+        ok, points, timestamp = lidar_source.read()
+        if not ok or points is None or timestamp is None:
+            break
+        raw_points_per_frame.append(points)
+        timestamps.append(float(timestamp))
+
+    ie_poses_per_frame = [ie_pose_provider.get_interpolated(ts) for ts in timestamps]
+
     try:
-        while True:
-            ok, points, timestamp = lidar_source.read()
-            if not ok or points is None or timestamp is None:
-                break
+        for frame_index, timestamp in enumerate(timestamps):
+            points = temporal_fuse_points(
+                frame_index=frame_index,
+                points_per_frame=raw_points_per_frame,
+                timestamps=timestamps,
+                temporal_cfg=temporal_cfg,
+                ie_poses_per_frame=ie_poses_per_frame,
+                ecef_origin=ecef_origin,
+                enu_from_ecef=enu_from_ecef,
+            )
 
             raw_count = int(points.shape[0])
             roi_points = crop_points(points, lidar_config.get("roi", {}))
             point_count_after_roi = int(roi_points.shape[0])
             no_ego_points = remove_ego_vehicle_points(roi_points, lidar_config.get("ego_vehicle_filter", {}))
             point_count_after_ego_filter = int(no_ego_points.shape[0])
-            processed = remove_ground(no_ego_points, lidar_config.get("ground_removal", {}))
-            point_count_after_ground_removal = int(processed.shape[0])
             aruco_prior = aruco_provider.get_prior(timestamp)
             aruco_debug = aruco_provider.get_debug_state()
+            ground_cfg = dict(lidar_config.get("ground_removal", {}))
+            protect_regions = build_ground_protect_regions(tracker, aruco_prior, ground_cfg)
+            if protect_regions:
+                ground_cfg["protect_regions"] = protect_regions
+            processed = remove_ground(no_ego_points, ground_cfg)
+            point_count_after_ground_removal = int(processed.shape[0])
             use_local_roi = local_roi_recovery_countdown <= 0
             processed = apply_aruco_local_roi(
                 processed,
@@ -1138,6 +1696,12 @@ def main() -> None:
                 tolerance=float(clustering_cfg["tolerance_m"]),
                 min_points=int(clustering_cfg["min_cluster_points"]),
                 max_points=int(clustering_cfg["max_cluster_points"]),
+            )
+            clusters = merge_vertical_person_clusters(
+                clusters,
+                xy_merge_distance_m=float(clustering_cfg.get("merge_xy_distance_m", 0.55)),
+                z_gap_m=float(clustering_cfg.get("merge_z_gap_m", 0.9)),
+                max_merged_points=int(clustering_cfg.get("merge_max_points", 8000)),
             )
             cluster_count = len(clusters)
             geometric_candidates = filter_candidates(clusters, lidar_config["person_cluster"])
@@ -1165,20 +1729,32 @@ def main() -> None:
                 min_points=int(clustering_cfg["min_cluster_points"]),
                 max_points=int(clustering_cfg["max_cluster_points"]),
             ) if segmented_points.shape[0] > 0 else []
+            segmented_clusters = merge_vertical_person_clusters(
+                segmented_clusters,
+                xy_merge_distance_m=float(clustering_cfg.get("merge_xy_distance_m", 0.55)),
+                z_gap_m=float(clustering_cfg.get("merge_z_gap_m", 0.9)),
+                max_merged_points=int(clustering_cfg.get("merge_max_points", 8000)),
+            ) if segmented_clusters else []
             segmentation_cluster_count = len(segmented_clusters)
             segmentation_candidates = filter_candidates(segmented_clusters, lidar_config["person_cluster"])
-            aruco_nearest_distance_m = nearest_candidate_distance(candidates, aruco_prior)
-            prioritized_candidates = []
-            if aruco_prior is not None:
-                prioritized_candidates = merge_prioritized_candidates(
-                    segmentation_candidates=segmentation_candidates,
-                    candidates=merge_prioritized_candidates(
-                        segmentation_candidates=aruco_rescue_candidates,
-                        candidates=candidates,
+            detector_mode = detector_source_mode.lower()
+            if detector_mode == "aruco_mask_v2":
+                candidates = build_target_mask_v2_candidates(segmented_clusters, lidar_config["person_cluster"])
+                candidate_source = "aruco_mask_v2"
+                prioritized_candidates = list(candidates)
+            else:
+                prioritized_candidates = []
+                if aruco_prior is not None:
+                    prioritized_candidates = merge_prioritized_candidates(
+                        segmentation_candidates=segmentation_candidates,
+                        candidates=merge_prioritized_candidates(
+                            segmentation_candidates=aruco_rescue_candidates,
+                            candidates=candidates,
+                            dedup_distance_m=float(lidar_config.get("segmentation", {}).get("candidate_dedup_distance_m", 0.2)),
+                        ),
                         dedup_distance_m=float(lidar_config.get("segmentation", {}).get("candidate_dedup_distance_m", 0.2)),
-                    ),
-                    dedup_distance_m=float(lidar_config.get("segmentation", {}).get("candidate_dedup_distance_m", 0.2)),
-                )
+                    )
+            aruco_nearest_distance_m = nearest_candidate_distance(candidates, aruco_prior)
             rescue_candidate_keys = {candidate_key(candidate) for candidate in aruco_rescue_candidates}
 
             def motion_cfg_for(candidate: ClusterCandidate) -> dict[str, Any]:
@@ -1346,6 +1922,51 @@ def main() -> None:
                 state=state,
             )
             json_writer.append(record)
+            ie_pose = ie_pose_provider.get_interpolated(timestamp)
+            target_lidar = None if state is None else state.position
+            target_body = None if target_lidar is None else lidar_to_ie_body(target_lidar)
+            if aruco_debug.target_result is not None and "id" in aruco_debug.target_result:
+                target_name: Any = aruco_debug.target_result["id"]
+            else:
+                target_name = list(aruco_provider.target_ids)
+            world_record: dict[str, Any] = {
+                "timestamp": float(timestamp),
+                "datetime": datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat(),
+                "target_name": target_name,
+                "target_lidar_m": None if target_lidar is None else np.round(target_lidar, 6).tolist(),
+                "target_world_lla": None,
+                "target_world_enu_m": None,
+                "ie_pose": None,
+            }
+            if ie_pose is not None:
+                world_record["ie_pose"] = {
+                    "timestamp": round(float(ie_pose.timestamp), 6),
+                    "latitude_deg": round(float(ie_pose.latitude_deg), 9),
+                    "longitude_deg": round(float(ie_pose.longitude_deg), 9),
+                    "height_m": round(float(ie_pose.height_m), 6),
+                    "roll_deg": round(float(ie_pose.roll_deg), 6),
+                    "pitch_deg": round(float(ie_pose.pitch_deg), 6),
+                    "heading_deg": round(float(ie_pose.heading_deg), 6),
+                }
+                if target_body is not None and ecef_origin is not None and enu_from_ecef is not None:
+                    rot_enu_from_body = rotation_matrix_from_ie(
+                        roll_deg=ie_pose.roll_deg,
+                        pitch_deg=ie_pose.pitch_deg,
+                        heading_deg=ie_pose.heading_deg,
+                    )
+                    lidar_ecef = _geodetic_to_ecef(ie_pose.latitude_deg, ie_pose.longitude_deg, ie_pose.height_m)
+                    target_offset_enu = rot_enu_from_body @ target_body
+                    enu_to_ecef = _enu_to_ecef_matrix(ie_pose.latitude_deg, ie_pose.longitude_deg)
+                    target_ecef = lidar_ecef + (enu_to_ecef @ target_offset_enu)
+                    target_lat, target_lon, target_h = _ecef_to_geodetic(target_ecef)
+                    target_enu = enu_from_ecef @ (target_ecef - ecef_origin)
+                    world_record["target_world_lla"] = [
+                        round(float(target_lat), 9),
+                        round(float(target_lon), 9),
+                        round(float(target_h), 6),
+                    ]
+                    world_record["target_world_enu_m"] = np.round(target_enu, 6).tolist()
+            target_world_writer.append(world_record)
 
             if bool(logging_cfg.get("print_summary_every_frame", False)):
                 aruco_text = "none"
@@ -1371,13 +1992,13 @@ def main() -> None:
             else:
                 print(json.dumps(record, ensure_ascii=False))
 
-            frame_index += 1
     except KeyboardInterrupt:
         interrupted = True
     finally:
         lidar_source.release()
         aruco_provider.release()
         json_writer.flush()
+        target_world_writer.flush()
 
     if interrupted:
         print("Interrupted by user.")

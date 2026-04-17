@@ -488,47 +488,179 @@ def remove_ego_vehicle_points(points: np.ndarray, ego_cfg: dict[str, Any]) -> np
     return points[mask]
 
 
+def _fit_plane_least_squares(xyz: np.ndarray) -> tuple[float, float, float] | None:
+    """
+    Fit plane z = ax + by + c
+    Returns (a, b, c), or None if not enough points.
+    """
+    if xyz.shape[0] < 3:
+        return None
+
+    A = np.c_[xyz[:, 0], xyz[:, 1], np.ones(xyz.shape[0])]
+    b = xyz[:, 2]
+    try:
+        coef, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        return float(coef[0]), float(coef[1]), float(coef[2])
+    except np.linalg.LinAlgError:
+        return None
+
+
+def _points_in_protect_regions(
+    points_xyz: np.ndarray,
+    protect_regions: list[dict[str, Any]],
+    default_radius_m: float,
+    default_z_margin_m: float,
+) -> np.ndarray:
+    if points_xyz.size == 0 or not protect_regions:
+        return np.zeros(points_xyz.shape[0], dtype=bool)
+
+    mask = np.zeros(points_xyz.shape[0], dtype=bool)
+    for region in protect_regions:
+        if not isinstance(region, dict):
+            continue
+        if "x" not in region or "y" not in region:
+            continue
+        cx = float(region["x"])
+        cy = float(region["y"])
+        radius = max(float(region.get("radius_m", default_radius_m)), 1e-3)
+        dx = points_xyz[:, 0] - cx
+        dy = points_xyz[:, 1] - cy
+        in_xy = (dx * dx + dy * dy) <= radius * radius
+
+        if "z" in region:
+            cz = float(region["z"])
+            z_margin = max(float(region.get("z_margin_m", default_z_margin_m)), 0.0)
+            in_z = points_xyz[:, 2] <= (cz + z_margin)
+            in_xy &= in_z
+
+        mask |= in_xy
+    return mask
+
+
 def remove_ground(points: np.ndarray, ground_cfg: dict[str, Any]) -> np.ndarray:
-    method = str(ground_cfg.get("method", "z_threshold"))
+    if points.size == 0:
+        return points
+
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError(f"points must have shape (N, >=3), got {points.shape}")
+
+    method = str(ground_cfg.get("method", "z_threshold")).lower()
     z_min = float(ground_cfg.get("z_min", -math.inf))
     z_max = float(ground_cfg.get("z_max", math.inf))
-    valid_z = (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
+    z = points[:, 2]
+    valid_z = (z >= z_min) & (z <= z_max)
     points = points[valid_z]
     if points.size == 0:
         return points
 
     if method == "z_threshold":
+        # Backward-compatible behavior: keep points inside configured z range.
         return points
-    if method != "adaptive_grid":
+
+    if method not in {"adaptive_grid", "adaptive_plane"}:
         raise ValueError(f"Unsupported ground removal method: {method}")
 
-    cell_size_m = max(float(ground_cfg.get("cell_size_m", 0.4)), 1e-3)
+    cell_size_m = max(float(ground_cfg.get("cell_size_m", 0.5)), 1e-3)
     ground_quantile = float(np.clip(ground_cfg.get("ground_quantile", 0.15), 0.0, 1.0))
     clearance_m = float(ground_cfg.get("clearance_m", 0.12))
-    min_points_per_cell = max(int(ground_cfg.get("min_points_per_cell", 6)), 1)
+    min_points_per_cell = max(int(ground_cfg.get("min_points_per_cell", 4)), 1)
     fallback_clearance_m = float(ground_cfg.get("fallback_clearance_m", 0.18))
+    neighbor_radius = max(int(ground_cfg.get("neighbor_radius", 1)), 0)
+    protect_regions = list(ground_cfg.get("protect_regions", []))
+    protect_radius_m = float(ground_cfg.get("protect_radius_m", 0.35))
+    protect_z_margin_m = float(ground_cfg.get("protect_z_margin_m", 0.7))
+    protect_mask = _points_in_protect_regions(points[:, :3], protect_regions, protect_radius_m, protect_z_margin_m)
 
     grid_xy = np.floor(points[:, :2] / cell_size_m).astype(np.int32)
-    cell_to_indices: dict[tuple[int, int], list[int]] = {}
-    for index, (gx, gy) in enumerate(grid_xy):
-        key = (int(gx), int(gy))
-        if key not in cell_to_indices:
-            cell_to_indices[key] = []
-        cell_to_indices[key].append(index)
 
-    keep = np.zeros(points.shape[0], dtype=bool)
-    for indices in cell_to_indices.values():
-        cell_points = points[np.asarray(indices, dtype=np.int32)]
-        cell_z = cell_points[:, 2]
-        if cell_z.shape[0] < min_points_per_cell:
+    cell_to_indices: dict[tuple[int, int], list[int]] = {}
+    for idx, (gx, gy) in enumerate(grid_xy):
+        key = (int(gx), int(gy))
+        cell_to_indices.setdefault(key, []).append(idx)
+
+    # Step 1: estimate one low representative point per cell
+    low_repr_map: dict[tuple[int, int], np.ndarray] = {}
+    ground_z_map: dict[tuple[int, int], float] = {}
+    clearance_map: dict[tuple[int, int], float] = {}
+
+    for key, indices_list in cell_to_indices.items():
+        indices = np.asarray(indices_list, dtype=np.int32)
+        cell_pts = points[indices]
+        cell_z = cell_pts[:, 2]
+
+        if cell_pts.shape[0] < min_points_per_cell:
             local_ground = float(np.min(cell_z))
             local_clearance = fallback_clearance_m
         else:
             local_ground = float(np.quantile(cell_z, ground_quantile))
             local_clearance = clearance_m
-        keep_cell = cell_z >= (local_ground + local_clearance)
-        for local_idx, src_idx in enumerate(indices):
-            keep[src_idx] = bool(keep_cell[local_idx])
+
+        # representative low point near the estimated ground
+        target_idx = int(np.argmin(np.abs(cell_z - local_ground)))
+        low_repr_map[key] = cell_pts[target_idx, :3]
+        ground_z_map[key] = local_ground
+        clearance_map[key] = local_clearance
+
+    keep = np.ones(points.shape[0], dtype=bool)
+
+    # Simple adaptive_grid fallback
+    if method == "adaptive_grid":
+        for key, indices_list in cell_to_indices.items():
+            indices = np.asarray(indices_list, dtype=np.int32)
+            cell_z = points[indices, 2]
+            local_ground = ground_z_map[key]
+            local_clearance = clearance_map[key]
+            ground_mask = cell_z <= (local_ground + local_clearance)
+            if protect_regions:
+                ground_mask &= ~protect_mask[indices]
+            keep[indices[ground_mask]] = False
+        return points[keep]
+
+    # Step 2: adaptive_plane
+    for key, indices_list in cell_to_indices.items():
+        gx, gy = key
+        neigh_pts = []
+
+        for dx in range(-neighbor_radius, neighbor_radius + 1):
+            for dy in range(-neighbor_radius, neighbor_radius + 1):
+                nkey = (gx + dx, gy + dy)
+                if nkey in low_repr_map:
+                    neigh_pts.append(low_repr_map[nkey])
+
+        indices = np.asarray(indices_list, dtype=np.int32)
+        cell_pts = points[indices, :3]
+
+        if len(neigh_pts) < 3:
+            local_ground = ground_z_map[key]
+            local_clearance = clearance_map[key]
+            ground_mask = cell_pts[:, 2] <= (local_ground + local_clearance)
+            if protect_regions:
+                ground_mask &= ~protect_mask[indices]
+            keep[indices[ground_mask]] = False
+            continue
+
+        neigh_pts_arr = np.asarray(neigh_pts, dtype=np.float64)
+        plane = _fit_plane_least_squares(neigh_pts_arr)
+
+        if plane is None:
+            local_ground = ground_z_map[key]
+            local_clearance = clearance_map[key]
+            ground_mask = cell_pts[:, 2] <= (local_ground + local_clearance)
+            if protect_regions:
+                ground_mask &= ~protect_mask[indices]
+            keep[indices[ground_mask]] = False
+            continue
+
+        a, b, c = plane
+        z_pred = a * cell_pts[:, 0] + b * cell_pts[:, 1] + c
+        dist = cell_pts[:, 2] - z_pred
+
+        local_clearance = clearance_map[key]
+        ground_mask = dist <= local_clearance
+        if protect_regions:
+            ground_mask &= ~protect_mask[indices]
+        keep[indices[ground_mask]] = False
+
     return points[keep]
 
 
@@ -567,6 +699,56 @@ def euclidean_clusters(points: np.ndarray, tolerance: float, min_points: int, ma
             clusters.append(points[np.asarray(member_indices, dtype=np.int32)])
 
     return clusters
+
+
+def merge_vertical_person_clusters(
+    clusters: list[np.ndarray],
+    xy_merge_distance_m: float = 0.55,
+    z_gap_m: float = 0.9,
+    max_merged_points: int = 8000,
+) -> list[np.ndarray]:
+    if len(clusters) <= 1:
+        return clusters
+
+    merged = [cluster.copy() for cluster in clusters]
+    changed = True
+    while changed:
+        changed = False
+        next_clusters: list[np.ndarray] = []
+        used = [False] * len(merged)
+        for i in range(len(merged)):
+            if used[i]:
+                continue
+            base = merged[i]
+            base_min = np.min(base, axis=0)
+            base_max = np.max(base, axis=0)
+            for j in range(i + 1, len(merged)):
+                if used[j]:
+                    continue
+                other = merged[j]
+                other_min = np.min(other, axis=0)
+                other_max = np.max(other, axis=0)
+                base_xy = 0.5 * (base_min[:2] + base_max[:2])
+                other_xy = 0.5 * (other_min[:2] + other_max[:2])
+                xy_distance = float(np.linalg.norm(base_xy - other_xy))
+                if xy_distance > xy_merge_distance_m:
+                    continue
+                # Positive gap means disjoint vertical stacks; negative means overlap.
+                z_gap = max(float(other_min[2] - base_max[2]), float(base_min[2] - other_max[2]), 0.0)
+                if z_gap > z_gap_m:
+                    continue
+                candidate = np.concatenate([base, other], axis=0)
+                if candidate.shape[0] > int(max_merged_points):
+                    continue
+                base = candidate
+                base_min = np.min(base, axis=0)
+                base_max = np.max(base, axis=0)
+                used[j] = True
+                changed = True
+            used[i] = True
+            next_clusters.append(base)
+        merged = next_clusters
+    return merged
 
 
 def compute_candidate(cluster_id: int, cluster: np.ndarray) -> ClusterCandidate:
