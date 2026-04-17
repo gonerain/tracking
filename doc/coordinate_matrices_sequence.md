@@ -116,7 +116,7 @@
 
 ---
 
-## 8) 姿态：ENU -> Body(RFU)（CPT7 原始输出）
+## 8) 姿态：ENU -> CPT7 RFU（CPT7 原始输出）
 
 SPAN CPT7 的 `roll/pitch/azimuth` 直接定义 ENU 到车体 RFU 系的基变换：
 
@@ -151,34 +151,41 @@ R_z(-A) =
 
 ---
 
-## 9) RFU <-> FRD（固定轴变换）
+## 9) RFU -> FLU（固定 90° 绕 z 旋转）
 
-span_link 在外参链中定义为 FRD，所以 CPT7 的 RFU 与 span_link 的 FRD 之间需要一次静态轴变换。该矩阵为对合（involution），两方向相同：
+CPT7 内部体系为 RFU，而本项目车体（base_link）为 FLU，二者差一个绕 z 的 90° 旋转：
 
 ```text
-R_{RFU<-FRD} = R_{FRD<-RFU} =
-[[0, 1,  0],
- [1, 0,  0],
- [0, 0, -1]]
+R_{RFU<-FLU} =
+[[ 0, -1, 0],
+ [ 1,  0, 0],
+ [ 0,  0, 1]]
+
+R_{FLU<-RFU} = (R_{RFU<-FLU})^T =
+[[ 0,  1, 0],
+ [-1,  0, 0],
+ [ 0,  0, 1]]
 ```
+
+注意：这是一个 det = +1 的正交旋转，不是 FRD↔RFU 的对合轴交换。
 
 ---
 
-## 10) Body(FRD) -> ENU（每帧动态）
+## 10) Body(FLU) -> ENU（每帧动态）
 
 ```text
 R_{ENU<-RFU} = (C_{ENU->RFU})^T
-R_{ENU<-body(FRD)} = R_{ENU<-RFU} * R_{RFU<-FRD}
+R_{ENU<-body(FLU)} = R_{ENU<-RFU} * R_{RFU<-FLU}
 ```
 
 这个矩阵用于：
 
 - 时序点云补偿（跨帧点从 src body 转到 world，再到 dst body）
-- target 世界坐标输出（`target_lidar -> target_body -> target_world`）
+- target 世界坐标输出（`target_lidar -> target_body(FLU @ span origin) -> target_world`）
 
-### 10.1 ENU -> Span/Body(FRD) 的矩阵计算过程
+### 10.1 ENU -> Body(FLU) 的矩阵计算过程
 
-目标是把世界系 ENU 点转换到 SPAN body（FRD）：
+目标是把世界系 ENU 点转换到车体 FLU（原点在 SPAN 位置）：
 
 ```text
 p_body = R_{body<-ENU} * (p_ENU - p_span_ENU)
@@ -198,28 +205,28 @@ R_{RFU<-ENU} = R_y(R) * R_x(P) * R_z(-A)
 R_{ENU<-RFU} = (R_{RFU<-ENU})^T
 ```
 
-#### Step 3: RFU -> FRD 轴变换
+#### Step 3: RFU -> FLU 90° 旋转
 
 ```text
-R_{ENU<-FRD} = R_{ENU<-RFU} * R_{RFU<-FRD}
+R_{ENU<-FLU} = R_{ENU<-RFU} * R_{RFU<-FLU}
 ```
 
-#### Step 4: ENU -> Body(FRD)
+#### Step 4: ENU -> Body(FLU)
 
 ```text
-R_{body(FRD)<-ENU} = (R_{ENU<-FRD})^T
+R_{body(FLU)<-ENU} = (R_{ENU<-FLU})^T
 ```
 
 代入点变换即：
 
 ```text
-p_body = (R_{ENU<-FRD})^T * (p_ENU - p_span_ENU)
+p_body = (R_{ENU<-FLU})^T * (p_ENU - p_span_ENU)
 ```
 
 与当前代码的行向量写法等价：
 
 ```text
-pts_body = (pts_world - span_enu) @ R_{ENU<-FRD}
+pts_body = (pts_world - span_enu) @ R_{ENU<-FLU}
 ```
 
 ---
@@ -286,14 +293,15 @@ p_ECEF = p0_ECEF + R_ECEF<-ENU * p_ENU
 
 ## 12) 在代码中的应用顺序（点级）
 
-以 LiDAR 点 `p_L` 为例：
+以 LiDAR 点 `p_L` 为例（`lidar_to_ie_body` 的等效链路）：
 
 ```text
-p_L
- -> p_S(frd)                [H_S(frd)<-L]
- -> p_ENU/world             [R_ENU<-body + span position]
- -> p_S(frd)_dst            [目标帧姿态/位姿逆]
- -> p_L_dst                 [H_L<-S(frd)]
+p_L (lidar FLU)
+ -> p_body (vehicle FLU, 原点位于 SPAN)    [R_B<-L @ p_L + (t_B<-L - t_B<-S)]
+ -> p_ENU / world                           [R_ENU<-FLU @ p_body + span_ENU]
+ -> p_body_dst (vehicle FLU @ dst SPAN)     [R_FLU<-ENU_dst @ (p_ENU - dst_span_ENU)]
+ -> p_L_dst                                 [ie_body_to_lidar(p_body_dst)]
 ```
 
-以上就是当前实现中涉及到的完整变换链。
+注：代码中 `R_SPAN_FROM_LIDAR @ p_L + T_SPAN_FROM_LIDAR_M` 的中间结果是 span FRD，
+`lidar_to_ie_body` 随后通过 `[x, -y, -z]` 将其转回车体 FLU（原点保留在 SPAN）。
