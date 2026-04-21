@@ -672,12 +672,23 @@ def pairwise_distances(points: np.ndarray) -> np.ndarray:
 def euclidean_clusters(points: np.ndarray, tolerance: float, min_points: int, max_points: int) -> list[np.ndarray]:
     if points.size == 0:
         return []
+    if tolerance <= 0.0:
+        raise ValueError(f"tolerance must be positive, got {tolerance}")
 
-    distances = pairwise_distances(points)
-    visited = np.zeros(points.shape[0], dtype=bool)
+    num_points = int(points.shape[0])
+    visited = np.zeros(num_points, dtype=bool)
+    tolerance_sq = float(tolerance * tolerance)
+
+    # Spatial hash: map each point to a cubic cell to avoid O(N^2) pair checks.
+    inv_cell_size = 1.0 / float(tolerance)
+    grid = np.floor(points[:, :3] * inv_cell_size).astype(np.int32)
+    cell_to_indices: dict[tuple[int, int, int], list[int]] = {}
+    for idx, cell in enumerate(grid):
+        key = (int(cell[0]), int(cell[1]), int(cell[2]))
+        cell_to_indices.setdefault(key, []).append(idx)
+
     clusters: list[np.ndarray] = []
-
-    for start_index in range(points.shape[0]):
+    for start_index in range(num_points):
         if visited[start_index]:
             continue
 
@@ -688,12 +699,24 @@ def euclidean_clusters(points: np.ndarray, tolerance: float, min_points: int, ma
         while queue:
             current = queue.popleft()
             member_indices.append(current)
-            neighbors = np.flatnonzero(distances[current] <= tolerance)
-            for neighbor in neighbors.tolist():
-                if visited[neighbor]:
-                    continue
-                visited[neighbor] = True
-                queue.append(neighbor)
+
+            cx, cy, cz = (int(grid[current, 0]), int(grid[current, 1]), int(grid[current, 2]))
+            current_point = points[current]
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        nkey = (cx + dx, cy + dy, cz + dz)
+                        neighbor_indices = cell_to_indices.get(nkey)
+                        if neighbor_indices is None:
+                            continue
+                        for neighbor in neighbor_indices:
+                            if visited[neighbor]:
+                                continue
+                            diff = points[neighbor] - current_point
+                            if float(np.dot(diff, diff)) > tolerance_sq:
+                                continue
+                            visited[neighbor] = True
+                            queue.append(neighbor)
 
         if min_points <= len(member_indices) <= max_points:
             clusters.append(points[np.asarray(member_indices, dtype=np.int32)])

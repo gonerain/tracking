@@ -19,7 +19,6 @@ from core.lidar_tracking import (
     ClusterCandidate,
     JsonRecordWriter,
     RosbagLidarSource,
-    SimpleTracker,
     TrackState,
     compute_candidate,
     crop_points,
@@ -36,12 +35,10 @@ from core.lidar_tracking import (
 )
 from core.segmentation import SegmentationPredictor, extract_person_masks, select_relevant_person_masks
 from core.tracking import (
-    TargetTracker,
     draw_tracking_overlay,
     get_target_id_groups,
     get_target_ids,
     get_target_offsets,
-    select_target,
     select_targets,
     target_ids_label,
 )
@@ -220,13 +217,12 @@ class MultiObjectTracker:
 
 
 def build_ground_protect_regions(
-    tracker: SimpleTracker,
+    track_positions: list[np.ndarray],
     aruco_priors: list[ArucoPrior],
     ground_cfg: dict[str, Any],
 ) -> list[dict[str, float]]:
     regions: list[dict[str, float]] = []
-    if tracker.last_state is not None and tracker.track_lifecycle != "lost":
-        pos = tracker.last_state.position
+    for pos in track_positions:
         regions.append(
             {
                 "x": float(pos[0]),
@@ -264,14 +260,16 @@ class IePose:
 
 
 class TargetWorldWriter:
-    def __init__(self, output_path: Path) -> None:
+    def __init__(self, output_path: Path, flush_every_frame: bool) -> None:
         self.output_path = output_path
+        self.flush_every_frame = bool(flush_every_frame)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.records: list[dict[str, Any]] = []
 
     def append(self, record: dict[str, Any]) -> None:
         self.records.append(record)
-        self.flush()
+        if self.flush_every_frame:
+            self.flush()
 
     def flush(self) -> None:
         payload = "\n".join(json.dumps(item, ensure_ascii=False) for item in self.records)
@@ -615,13 +613,7 @@ class ArucoPriorProvider:
         self.target_ids = get_target_ids(tracking_cfg)
         self.target_offsets = get_target_offsets(tracking_cfg, self.target_ids)
         self.target_label = target_ids_label(self.target_id_groups)
-        self.tracker = TargetTracker(
-            history_size=int(tracking_cfg.get("history_size", 10)),
-            max_prediction_duration_s=float(tracking_cfg.get("max_prediction_duration_s", 1.0)),
-            allow_prediction=bool(tracking_cfg.get("allow_prediction", False)),
-        )
         self.latest_timestamp: float | None = None
-        self.latest_visible = False
         self.pending_frame: tuple[np.ndarray, float] | None = None
         self.latest_frame: np.ndarray | None = None
         self.latest_results: list[dict[str, Any]] = []
@@ -679,17 +671,7 @@ class ArucoPriorProvider:
                 min_area_px=int(self.segmentation_cfg.get("min_person_mask_area_px", 3000)),
                 max_instances=int(self.segmentation_cfg.get("max_instances_considered", 3)),
             )
-            if target is not None:
-                self.latest_tracking_state = self.tracker.update(
-                    timestamp=frame_timestamp,
-                    position_camera=np.asarray(target["center_in_camera_m"], dtype=np.float64),
-                    position_target=np.asarray(target["center_in_target_m"], dtype=np.float64),
-                    corners=np.asarray(target["corners"], dtype=np.float64),
-                )
-                self.latest_visible = True
-            else:
-                self.latest_tracking_state = None
-                self.latest_visible = False
+            self.latest_tracking_state = None
 
     def get_prior(self, timestamp: float) -> ArucoPrior | None:
         priors = self.get_priors(timestamp)
@@ -1520,16 +1502,6 @@ def main() -> None:
     tracker_cfg = lidar_config["tracker"]
     logging_cfg = lidar_config.get("logging", {})
 
-    tracker = SimpleTracker(
-        gating_distance_m=float(tracker_cfg.get("gating_distance_m", 1.0)),
-        max_prediction_duration_s=float(tracker_cfg.get("max_prediction_duration_s", 0.5)),
-        process_gain=float(tracker_cfg.get("process_gain", 0.6)),
-        allow_prediction=bool(tracker_cfg.get("allow_prediction", False)),
-        confirm_hits=int(tracker_cfg.get("confirm_hits", 3)),
-        forget_misses=int(tracker_cfg.get("forget_misses", 8)),
-        quality_hit_gain=float(tracker_cfg.get("quality_hit_gain", 0.2)),
-        quality_miss_decay=float(tracker_cfg.get("quality_miss_decay", 0.85)),
-    )
     multi_tracker = MultiObjectTracker(
         gating_distance_m=float(tracker_cfg.get("multi_gating_distance_m", tracker_cfg.get("gating_distance_m", 1.0))),
         max_prediction_duration_s=float(
@@ -1546,7 +1518,8 @@ def main() -> None:
             "tracking": aruco_config.get("tracking", {}),
         }
     )
-    json_writer = JsonRecordWriter(
+    write_fusion_json = bool(logging_cfg.get("write_fusion_json", True))
+    json_writer = None if not write_fusion_json else JsonRecordWriter(
         output_path=Path(str(args.output_json)),
         flush_every_frame=bool(logging_cfg.get("flush_every_frame", True)),
     )
@@ -1556,7 +1529,11 @@ def main() -> None:
         "data/2026-04-14_mongkok-opensky-walk-006/raw/novatel/ie/ie.txt",
     )
     ie_pose_provider = IePoseProvider(load_ie_poses(Path(str(ie_path_value))))
-    target_world_writer = TargetWorldWriter(Path(str(args.output_target_world_json)))
+    write_target_world_json = bool(logging_cfg.get("write_target_world_json", True))
+    target_world_writer = TargetWorldWriter(
+        Path(str(args.output_target_world_json)),
+        flush_every_frame=bool(logging_cfg.get("flush_every_frame", True)),
+    )
     enu_origin_pose = ie_pose_provider.poses[0] if ie_pose_provider.available else None
     ecef_origin = None if enu_origin_pose is None else _geodetic_to_ecef(
         enu_origin_pose.latitude_deg,
@@ -1570,8 +1547,9 @@ def main() -> None:
 
     frame_index = 0
     interrupted = False
-    reconnect_streak = 0
     local_roi_recovery_countdown = 0
+    previous_track_positions: list[np.ndarray] = []
+    segmentation_enabled = bool(lidar_config.get("segmentation", {}).get("enabled", False))
 
     try:
         while True:
@@ -1588,7 +1566,7 @@ def main() -> None:
             aruco_prior = None if not aruco_priors else aruco_priors[0]
             aruco_debug = aruco_provider.get_debug_state()
             ground_cfg = dict(lidar_config.get("ground_removal", {}))
-            protect_regions = build_ground_protect_regions(tracker, aruco_priors, ground_cfg)
+            protect_regions = build_ground_protect_regions(previous_track_positions, aruco_priors, ground_cfg)
             if protect_regions:
                 ground_cfg["protect_regions"] = protect_regions
             processed = remove_ground(no_ego_points, ground_cfg)
@@ -1604,16 +1582,20 @@ def main() -> None:
                 aruco_prior,
                 aruco_target_centers,
                 lidar_config.get("roi", {}),
-                reconnect_streak=reconnect_streak,
+                reconnect_streak=0,
                 force_disable=not use_local_roi,
             )
             point_count_after_aruco_local_roi = int(processed.shape[0])
 
-            segmented_points, projected_point_count = select_points_in_target_mask(
-                points=processed,
-                aruco_debug=aruco_debug,
-                aruco_context=aruco_provider.context,
-            )
+            if segmentation_enabled:
+                segmented_points, projected_point_count = select_points_in_target_mask(
+                    points=processed,
+                    aruco_debug=aruco_debug,
+                    aruco_context=aruco_provider.context,
+                )
+            else:
+                segmented_points = processed
+                projected_point_count = int(processed.shape[0])
             segmented_clusters = euclidean_clusters(
                 points=segmented_points,
                 tolerance=float(clustering_cfg["tolerance_m"]),
@@ -1629,56 +1611,14 @@ def main() -> None:
             segmentation_cluster_count = len(segmented_clusters)
             candidates = build_target_mask_v2_candidates(segmented_clusters, lidar_config["person_cluster"])
 
-            def motion_cfg_for(candidate: ClusterCandidate) -> dict[str, Any]:
-                return build_motion_cfg(
-                    tracker_cfg=tracker_cfg,
-                    aruco_prior=aruco_prior,
-                    reconnect_streak=reconnect_streak,
-                    is_rescue_candidate=False,
-                )
-
-            aruco_selected_candidate = select_candidate_with_aruco_prior(
-                candidates=candidates,
-                aruco_prior=aruco_prior,
-                gating_distance_m=float(args.aruco_gating_distance),
-                tracker_state=tracker.last_state,
-                tracker_cfg=tracker_cfg,
-            )
-            if aruco_selected_candidate is not None and not is_candidate_motion_consistent(
-                candidate=aruco_selected_candidate,
-                last_state=tracker.last_state,
-                timestamp=timestamp,
-                tracker_cfg=motion_cfg_for(aruco_selected_candidate),
-                aruco_prior=aruco_prior,
-            ):
-                aruco_selected_candidate = None
-
-            if aruco_selected_candidate is not None:
-                tracker_candidates = [aruco_selected_candidate]
-            else:
-                tracker_candidates = [
-                    candidate
-                    for candidate in candidates
-                    if is_candidate_motion_consistent(
-                        candidate=candidate,
-                        last_state=tracker.last_state,
-                        timestamp=timestamp,
-                        tracker_cfg=motion_cfg_for(candidate),
-                        aruco_prior=aruco_prior,
-                    )
-                ]
+            aruco_selected_candidate = None
+            tracker_candidates = list(candidates)
             tracker_candidate_keys = {candidate_key(candidate) for candidate in tracker_candidates}
             aruco_selected_key = None if aruco_selected_candidate is None else candidate_key(aruco_selected_candidate)
             candidate_diagnostics: list[dict[str, Any]] = []
             for candidate in candidates:
                 key = candidate_key(candidate)
-                reject_reason = candidate_motion_reject_reason(
-                    candidate=candidate,
-                    last_state=tracker.last_state,
-                    timestamp=timestamp,
-                    tracker_cfg=motion_cfg_for(candidate),
-                    aruco_prior=aruco_prior,
-                )
+                reject_reason = None
                 distance_to_aruco_m = None
                 if aruco_prior is not None:
                     distance_to_aruco_m = float(np.linalg.norm(candidate.footpoint[:2] - aruco_prior.position_lidar[:2]))
@@ -1693,59 +1633,20 @@ def main() -> None:
                     }
                 )
 
-            state = tracker.update(timestamp=timestamp, candidates=tracker_candidates)
+            state = None
             used_aruco_fallback = False
-            if state is None and tracker.last_state is not None:
-                hold_duration_s = float(tracker_cfg.get("hold_without_match_duration_s", 0.35))
-                dt = float(timestamp - tracker.last_state.timestamp)
-                if 0.0 <= dt <= hold_duration_s:
-                    predicted_position = tracker.last_state.position + tracker.last_state.velocity * dt
-                    state = TrackState(
-                        timestamp=timestamp,
-                        position=predicted_position,
-                        velocity=tracker.last_state.velocity.copy(),
-                        source="predicted",
-                        candidate=None,
-                        track_quality=tracker.track_quality,
-                        track_lifecycle=tracker.track_lifecycle,
-                    )
-                    tracker.last_state = state
-            if state is None and aruco_prior is not None:
-                fallback_velocity = np.zeros(3, dtype=np.float64)
-                if tracker.last_state is not None:
-                    dt = float(timestamp - tracker.last_state.timestamp)
-                    if dt > 1e-3:
-                        fallback_velocity = (aruco_prior.position_lidar - tracker.last_state.position) / dt
-                state = TrackState(
-                    timestamp=timestamp,
-                    position=aruco_prior.position_lidar.copy(),
-                    velocity=fallback_velocity,
-                    source="aruco_fallback",
-                    candidate=None,
-                    track_quality=tracker.track_quality,
-                    track_lifecycle=tracker.track_lifecycle,
-                )
-                tracker.last_state = state
-                used_aruco_fallback = True
 
-            if aruco_prior is not None and int(len(tracker_candidates)) == 0:
+            if aruco_priors and int(len(tracker_candidates)) == 0:
                 local_cfg = lidar_config.get("roi", {}).get("local_with_aruco", {})
                 trigger_after = int(local_cfg.get("recovery_trigger_frames", 2))
                 recovery_frames = int(local_cfg.get("recovery_disable_frames", 4))
-                if reconnect_streak >= trigger_after:
+                if trigger_after <= 0:
                     local_roi_recovery_countdown = max(local_roi_recovery_countdown, recovery_frames)
             if local_roi_recovery_countdown > 0:
                 local_roi_recovery_countdown -= 1
 
-            if aruco_prior is not None:
-                if state is not None and state.source == "observed":
-                    reconnect_streak = 0
-                else:
-                    reconnect_streak += 1
-            else:
-                reconnect_streak = 0
-
             multi_tracks = multi_tracker.update(timestamp=timestamp, candidates=candidates)
+            previous_track_positions = [track.state.position.copy() for track in multi_tracks]
 
             debug_writer.write(
                 frame_index=frame_index,
@@ -1784,10 +1685,10 @@ def main() -> None:
                 state=state,
                 multi_tracks=multi_tracks,
             )
-            json_writer.append(record)
+            if json_writer is not None:
+                json_writer.append(record)
             ie_pose = ie_pose_provider.get_interpolated(timestamp)
-            target_lidar = None if state is None else state.position
-            target_body = None if target_lidar is None else lidar_to_ie_body(target_lidar)
+            target_lidar = None
             if aruco_debug.target_results:
                 target_name = [target.get("id") for target in aruco_debug.target_results if "id" in target]
             else:
@@ -1804,6 +1705,13 @@ def main() -> None:
                 "ie_pose": None,
             }
             if ie_pose is not None:
+                rot_enu_from_body = rotation_matrix_from_ie(
+                    roll_deg=ie_pose.roll_deg,
+                    pitch_deg=ie_pose.pitch_deg,
+                    heading_deg=ie_pose.heading_deg,
+                )
+                lidar_ecef = _geodetic_to_ecef(ie_pose.latitude_deg, ie_pose.longitude_deg, ie_pose.height_m)
+                enu_to_ecef = _enu_to_ecef_matrix(ie_pose.latitude_deg, ie_pose.longitude_deg)
                 world_record["ie_pose"] = {
                     "timestamp": round(float(ie_pose.timestamp), 6),
                     "latitude_deg": round(float(ie_pose.latitude_deg), 9),
@@ -1813,39 +1721,14 @@ def main() -> None:
                     "pitch_deg": round(float(ie_pose.pitch_deg), 6),
                     "heading_deg": round(float(ie_pose.heading_deg), 6),
                 }
-                if target_body is not None and ecef_origin is not None and enu_from_ecef is not None:
-                    rot_enu_from_body = rotation_matrix_from_ie(
-                        roll_deg=ie_pose.roll_deg,
-                        pitch_deg=ie_pose.pitch_deg,
-                        heading_deg=ie_pose.heading_deg,
-                    )
-                    lidar_ecef = _geodetic_to_ecef(ie_pose.latitude_deg, ie_pose.longitude_deg, ie_pose.height_m)
-                    target_offset_enu = rot_enu_from_body @ target_body
-                    enu_to_ecef = _enu_to_ecef_matrix(ie_pose.latitude_deg, ie_pose.longitude_deg)
-                    target_ecef = lidar_ecef + (enu_to_ecef @ target_offset_enu)
-                    target_lat, target_lon, target_h = _ecef_to_geodetic(target_ecef)
-                    target_enu = enu_from_ecef @ (target_ecef - ecef_origin)
-                    world_record["target_world_lla"] = [
-                        round(float(target_lat), 9),
-                        round(float(target_lon), 9),
-                        round(float(target_h), 6),
-                    ]
-                    world_record["target_world_enu_m"] = np.round(target_enu, 6).tolist()
                 if ecef_origin is not None and enu_from_ecef is not None:
                     for target in aruco_debug.target_results:
                         if "center_in_target_m" not in target:
                             continue
                         aruco_lidar = np.asarray(target["center_in_target_m"], dtype=np.float64).reshape(3)
                         aruco_body = lidar_to_ie_body(aruco_lidar)
-                        rot_enu_from_body = rotation_matrix_from_ie(
-                            roll_deg=ie_pose.roll_deg,
-                            pitch_deg=ie_pose.pitch_deg,
-                            heading_deg=ie_pose.heading_deg,
-                        )
-                        lidar_ecef = _geodetic_to_ecef(ie_pose.latitude_deg, ie_pose.longitude_deg, ie_pose.height_m)
                         aruco_offset_enu = rot_enu_from_body @ aruco_body
-                        enu_to_ecef_aruco = _enu_to_ecef_matrix(ie_pose.latitude_deg, ie_pose.longitude_deg)
-                        aruco_ecef = lidar_ecef + (enu_to_ecef_aruco @ aruco_offset_enu)
+                        aruco_ecef = lidar_ecef + (enu_to_ecef @ aruco_offset_enu)
                         aruco_lat, aruco_lon, aruco_h = _ecef_to_geodetic(aruco_ecef)
                         aruco_enu = enu_from_ecef @ (aruco_ecef - ecef_origin)
                         world_record["aruco_group_targets"].append(
@@ -1864,15 +1747,8 @@ def main() -> None:
                         )
                     for track in multi_tracks:
                         target_body_multi = lidar_to_ie_body(track.state.position)
-                        rot_enu_from_body = rotation_matrix_from_ie(
-                            roll_deg=ie_pose.roll_deg,
-                            pitch_deg=ie_pose.pitch_deg,
-                            heading_deg=ie_pose.heading_deg,
-                        )
-                        lidar_ecef = _geodetic_to_ecef(ie_pose.latitude_deg, ie_pose.longitude_deg, ie_pose.height_m)
                         target_offset_enu_multi = rot_enu_from_body @ target_body_multi
-                        enu_to_ecef_multi = _enu_to_ecef_matrix(ie_pose.latitude_deg, ie_pose.longitude_deg)
-                        target_ecef_multi = lidar_ecef + (enu_to_ecef_multi @ target_offset_enu_multi)
+                        target_ecef_multi = lidar_ecef + (enu_to_ecef @ target_offset_enu_multi)
                         target_lat_multi, target_lon_multi, target_h_multi = _ecef_to_geodetic(target_ecef_multi)
                         target_enu_multi = enu_from_ecef @ (target_ecef_multi - ecef_origin)
                         world_record["multi_targets"].append(
@@ -1903,7 +1779,8 @@ def main() -> None:
                         world_record["target_lidar_m"] = first_group_target["target_lidar_m"]
                         world_record["target_world_lla"] = first_group_target["target_world_lla"]
                         world_record["target_world_enu_m"] = first_group_target["target_world_enu_m"]
-            target_world_writer.append(world_record)
+            if write_target_world_json:
+                target_world_writer.append(world_record)
 
             if bool(logging_cfg.get("print_summary_every_frame", False)):
                 aruco_text = "none"
@@ -1913,7 +1790,7 @@ def main() -> None:
                         f"mask_points={segmented_points.shape[0]} "
                         f"sync_dt_ms={aruco_debug.sync_dt_ms if aruco_debug.sync_dt_ms is not None else 'none'}"
                     )
-                fused_text = "none" if state is None else f"{state.source} pos={np.round(state.position, 3).tolist()}"
+                fused_text = "none"
                 selected_text = (
                     "none"
                     if aruco_selected_candidate is None
@@ -1935,8 +1812,10 @@ def main() -> None:
     finally:
         lidar_source.release()
         aruco_provider.release()
-        json_writer.flush()
-        target_world_writer.flush()
+        if json_writer is not None:
+            json_writer.flush()
+        if write_target_world_json:
+            target_world_writer.flush()
 
     if interrupted:
         print("Interrupted by user.")

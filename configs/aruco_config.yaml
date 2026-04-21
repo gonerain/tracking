@@ -6,7 +6,7 @@ input:
     height: 1024
     fps: 10
   rosbag:
-    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-16-58-16_2.bag
+    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-17-00-50_4.bag
     topic: /front_camera/image/compressed
     start_time_s: 0.0
     end_time_s: null
@@ -70,7 +70,7 @@ logging:
   flush_every_frame: true
 
 debug:
-  save_images: true
+  save_images: false
   save_jsonl: true
   every_n_frames: 1
   aruco_output_dir: outputs/aruco_debug

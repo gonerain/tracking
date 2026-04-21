@@ -1,6 +1,6 @@
 input:
   rosbag:
-    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-16-58-16_2.bag
+    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-17-00-50_4.bag
     topic: /lidar
     start_time_s: null
     end_time_s: null
@@ -76,10 +76,6 @@ ie_lidar_extrinsics:
       - [0.0, 0.0, -1.0]
     translation_m: [-0.2684, -0.082, -0.1527]
 
-detector:
-  enabled: true
-  source: aruco_mask_v2
-
 person_cluster:
   min_points: 4
   min_points_with_aruco: 3
@@ -135,21 +131,17 @@ logging:
   output_json: outputs/lidar_tracking_log.json
   print_summary_every_frame: true
   flush_every_frame: true
+  write_fusion_json: false
+  write_target_world_json: true
 
 sync:
   camera_sync_max_dt_s: 0.08
 
 segmentation:
-  enabled: true
-  predictor_kind: detectron
-  task: instance
-  config_path: imseg/mask2former/config/swin/maskformer2_swin_large_IN21k_384_coco_instance_100ep.yaml
-  model_path: imseg/mask2former/model/mask2former_swin_large_coco_instance_100ep.pkl
+  enabled: false
   person_class_id: 0
   min_person_mask_area_px: 5000
   max_instances_considered: 5
-  candidate_dedup_distance_m: 0.2
-  camera_config: configs/aruco_config.yaml
 
 debug:
   save_images: true
