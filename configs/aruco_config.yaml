@@ -6,7 +6,7 @@ input:
     height: 1024
     fps: 10
   rosbag:
-    bag_path: data/2026-04-14_mongkok-opensky-walk-006/rosbag/segment_2026-04-14-17-31-17_2.bag
+    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-16-58-16_2.bag
     topic: /front_camera/image/compressed
     start_time_s: 0.0
     end_time_s: null
@@ -26,13 +26,13 @@ display:
   window_name: aruco_detection
 
 video:
-  save_enabled: false
+  save_enabled: true
   output_path: outputs/tracking_output.mp4
   fps: 30
   fourcc: mp4v
 
 aruco:
-  dictionary: DICT_5X5_50
+  dictionary: DICT_5X5_100
   marker_length_m: 0.10
   detector:
     adaptiveThreshWinSizeMin: 3
@@ -49,7 +49,11 @@ target_frame:
   translation_m: [0.051401176491, 0.015593452288, -0.06077996213]
 
 tracking:
-  target_ids: [0, 1, 2, 3]
+  # target_ids: [0, 1, 2, 3]
+  # Multi-board mode:
+  target_id_groups:
+    - [3, 17, 42, 88]
+    - [2, 19, 55, 81]
   # Per-marker offset from marker center to tracking reference point in lidar frame.
   # The values below align ArUco prior to lidar footpoint semantics.
   target_offsets_m:
@@ -64,3 +68,9 @@ tracking:
 logging:
   output_json: outputs/tracking_log.json
   flush_every_frame: true
+
+debug:
+  save_images: true
+  save_jsonl: true
+  every_n_frames: 1
+  aruco_output_dir: outputs/aruco_debug

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import bisect
-import importlib.util
 import json
 import math
 import re
@@ -36,7 +35,16 @@ from core.lidar_tracking import (
     stack_debug_images,
 )
 from core.segmentation import SegmentationPredictor, extract_person_masks, select_relevant_person_masks
-from core.tracking import TargetTracker, draw_tracking_overlay, get_target_ids, get_target_offsets, select_target, target_ids_label
+from core.tracking import (
+    TargetTracker,
+    draw_tracking_overlay,
+    get_target_id_groups,
+    get_target_ids,
+    get_target_offsets,
+    select_target,
+    select_targets,
+    target_ids_label,
+)
 
 
 @dataclass
@@ -55,15 +63,165 @@ class ArucoDebugState:
     results: list[dict[str, Any]]
     tracking_state: Any
     target_result: dict[str, Any] | None
+    target_results: list[dict[str, Any]]
     segmentation: Any
     target_person_mask: np.ndarray | None
     selected_person_masks: list[np.ndarray]
     raw_person_mask_count: int
 
 
+@dataclass
+class MultiTrack:
+    track_id: int
+    state: TrackState
+    hits: int
+    misses: int
+
+
+class MultiObjectTracker:
+    def __init__(
+        self,
+        gating_distance_m: float,
+        max_prediction_duration_s: float,
+        process_gain: float,
+        allow_prediction: bool,
+        confirm_hits: int,
+        forget_misses: int,
+    ) -> None:
+        self.gating_distance_m = float(gating_distance_m)
+        self.max_prediction_duration_s = float(max_prediction_duration_s)
+        self.process_gain = float(process_gain)
+        self.allow_prediction = bool(allow_prediction)
+        self.confirm_hits = max(int(confirm_hits), 1)
+        self.forget_misses = max(int(forget_misses), 1)
+        self._next_track_id = 1
+        self._tracks: dict[int, MultiTrack] = {}
+
+    def _predict_state(self, track: MultiTrack, timestamp: float) -> TrackState | None:
+        dt = float(timestamp - track.state.timestamp)
+        if dt < 0.0:
+            return None
+        if dt == 0.0:
+            return track.state
+        if dt > self.max_prediction_duration_s:
+            return None
+        predicted_position = track.state.position + track.state.velocity * dt
+        return TrackState(
+            timestamp=timestamp,
+            position=predicted_position,
+            velocity=track.state.velocity.copy(),
+            source="predicted",
+            candidate=None,
+            track_quality=track.state.track_quality,
+            track_lifecycle=track.state.track_lifecycle,
+        )
+
+    def _new_track(self, timestamp: float, candidate: ClusterCandidate) -> None:
+        track_id = self._next_track_id
+        self._next_track_id += 1
+        lifecycle = "confirmed" if self.confirm_hits <= 1 else "tentative"
+        self._tracks[track_id] = MultiTrack(
+            track_id=track_id,
+            state=TrackState(
+                timestamp=timestamp,
+                position=candidate.footpoint.copy(),
+                velocity=np.zeros(3, dtype=np.float64),
+                source="observed",
+                candidate=candidate,
+                track_quality=1.0,
+                track_lifecycle=lifecycle,
+            ),
+            hits=1,
+            misses=0,
+        )
+
+    def update(self, timestamp: float, candidates: list[ClusterCandidate]) -> list[MultiTrack]:
+        timestamp = float(timestamp)
+        if not self._tracks:
+            for candidate in candidates:
+                self._new_track(timestamp, candidate)
+            return self._reported_tracks()
+
+        track_ids = sorted(self._tracks.keys())
+        predicted_states = {track_id: self._predict_state(self._tracks[track_id], timestamp) for track_id in track_ids}
+
+        pair_costs: list[tuple[float, int, int]] = []
+        for candidate_index, candidate in enumerate(candidates):
+            for track_id in track_ids:
+                predicted = predicted_states.get(track_id)
+                if predicted is None:
+                    continue
+                distance = float(np.linalg.norm(candidate.footpoint[:2] - predicted.position[:2]))
+                if distance <= self.gating_distance_m:
+                    pair_costs.append((distance, track_id, candidate_index))
+        pair_costs.sort(key=lambda item: item[0])
+
+        assigned_tracks: set[int] = set()
+        assigned_candidates: set[int] = set()
+        matches: list[tuple[int, int]] = []
+        for _, track_id, candidate_index in pair_costs:
+            if track_id in assigned_tracks or candidate_index in assigned_candidates:
+                continue
+            assigned_tracks.add(track_id)
+            assigned_candidates.add(candidate_index)
+            matches.append((track_id, candidate_index))
+
+        for track_id, candidate_index in matches:
+            track = self._tracks[track_id]
+            candidate = candidates[candidate_index]
+            predicted = predicted_states.get(track_id)
+            if predicted is None:
+                predicted_position = track.state.position.copy()
+            else:
+                predicted_position = predicted.position
+            dt = max(timestamp - track.state.timestamp, 1e-3)
+            blended_position = predicted_position + self.process_gain * (candidate.footpoint - predicted_position)
+            new_velocity = (blended_position - track.state.position) / dt
+            track.hits += 1
+            track.misses = 0
+            lifecycle = "confirmed" if track.hits >= self.confirm_hits else "tentative"
+            track.state = TrackState(
+                timestamp=timestamp,
+                position=blended_position,
+                velocity=new_velocity,
+                source="observed",
+                candidate=candidate,
+                track_quality=float(track.hits) / float(max(track.hits + track.misses, 1)),
+                track_lifecycle=lifecycle,
+            )
+
+        lost_track_ids: list[int] = []
+        for track_id in track_ids:
+            if track_id in assigned_tracks:
+                continue
+            track = self._tracks[track_id]
+            track.misses += 1
+            predicted = predicted_states.get(track_id)
+            if predicted is not None and self.allow_prediction:
+                predicted.track_lifecycle = track.state.track_lifecycle
+                predicted.track_quality = float(track.hits) / float(max(track.hits + track.misses, 1))
+                track.state = predicted
+            if track.misses > self.forget_misses:
+                lost_track_ids.append(track_id)
+
+        for track_id in lost_track_ids:
+            self._tracks.pop(track_id, None)
+
+        for candidate_index, candidate in enumerate(candidates):
+            if candidate_index not in assigned_candidates:
+                self._new_track(timestamp, candidate)
+
+        return self._reported_tracks()
+
+    def _reported_tracks(self) -> list[MultiTrack]:
+        tracks = [track for track in self._tracks.values() if track.hits >= self.confirm_hits]
+        tracks.sort(key=lambda item: item.track_id)
+        return tracks
+
+
 def build_ground_protect_regions(
     tracker: SimpleTracker,
-    aruco_prior: ArucoPrior | None,
+    aruco_priors: list[ArucoPrior],
     ground_cfg: dict[str, Any],
 ) -> list[dict[str, float]]:
     regions: list[dict[str, float]] = []
@@ -78,7 +236,9 @@ def build_ground_protect_regions(
                 "z_margin_m": float(ground_cfg.get("track_protect_z_margin_m", 0.8)),
             }
         )
-    if aruco_prior is not None and bool(aruco_prior.visible):
+    for aruco_prior in aruco_priors:
+        if not bool(aruco_prior.visible):
+            continue
         pos = aruco_prior.position_lidar
         regions.append(
             {
@@ -445,237 +605,16 @@ def ie_pose_to_enu(
     return enu_from_ecef @ (ecef - ecef_origin)
 
 
-def transform_points_lidar_between_ie_poses(
-    points_lidar: np.ndarray,
-    src_pose: IePose,
-    dst_pose: IePose,
-    ecef_origin: np.ndarray,
-    enu_from_ecef: np.ndarray,
-) -> np.ndarray:
-    if points_lidar.size == 0:
-        return points_lidar
-    src_enu = ie_pose_to_enu(src_pose, ecef_origin, enu_from_ecef)
-    dst_enu = ie_pose_to_enu(dst_pose, ecef_origin, enu_from_ecef)
-    src_rot = rotation_matrix_from_ie(src_pose.roll_deg, src_pose.pitch_deg, src_pose.heading_deg)
-    dst_rot = rotation_matrix_from_ie(dst_pose.roll_deg, dst_pose.pitch_deg, dst_pose.heading_deg)
-
-    pts_body_src = np.asarray([lidar_to_ie_body(point) for point in points_lidar], dtype=np.float64)
-    pts_world = pts_body_src @ src_rot.T + src_enu.reshape(1, 3)
-    pts_body_dst = (pts_world - dst_enu.reshape(1, 3)) @ dst_rot
-    pts_lidar_dst = np.asarray([ie_body_to_lidar(point) for point in pts_body_dst], dtype=np.float64)
-    return pts_lidar_dst.astype(np.float64)
-
-
-def voxel_downsample(points: np.ndarray, voxel_size_m: float) -> np.ndarray:
-    if points.size == 0 or voxel_size_m <= 0.0:
-        return points
-    grid = np.floor(points / float(voxel_size_m)).astype(np.int32)
-    _, unique_indices = np.unique(grid, axis=0, return_index=True)
-    unique_indices = np.sort(unique_indices)
-    return points[unique_indices]
-
-
-def temporal_fuse_points(
-    frame_index: int,
-    points_per_frame: list[np.ndarray],
-    timestamps: list[float],
-    temporal_cfg: dict[str, Any],
-    ie_poses_per_frame: list[IePose | None],
-    ecef_origin: np.ndarray | None,
-    enu_from_ecef: np.ndarray | None,
-) -> np.ndarray:
-    if frame_index < 0 or frame_index >= len(points_per_frame):
-        return np.empty((0, 3), dtype=np.float64)
-    base_points = points_per_frame[frame_index]
-    if not bool(temporal_cfg.get("enabled", False)):
-        return base_points
-
-    half_window = max(int(temporal_cfg.get("half_window_frames", 1)), 0)
-    if half_window <= 0:
-        return base_points
-    max_time_span_s = float(temporal_cfg.get("max_time_span_s", 0.25))
-    use_motion_comp = bool(temporal_cfg.get("motion_compensation_with_ie", True))
-
-    center_ts = float(timestamps[frame_index])
-    center_pose = ie_poses_per_frame[frame_index]
-    chunks: list[np.ndarray] = []
-    for neighbor_index in range(max(0, frame_index - half_window), min(len(points_per_frame), frame_index + half_window + 1)):
-        pts = points_per_frame[neighbor_index]
-        if pts.size == 0:
-            continue
-        dt = abs(float(timestamps[neighbor_index] - center_ts))
-        if dt > max_time_span_s:
-            continue
-        if (
-            use_motion_comp
-            and neighbor_index != frame_index
-            and center_pose is not None
-            and ie_poses_per_frame[neighbor_index] is not None
-            and ecef_origin is not None
-            and enu_from_ecef is not None
-        ):
-            pts = transform_points_lidar_between_ie_poses(
-                points_lidar=pts,
-                src_pose=ie_poses_per_frame[neighbor_index],
-                dst_pose=center_pose,
-                ecef_origin=ecef_origin,
-                enu_from_ecef=enu_from_ecef,
-            )
-        chunks.append(pts)
-    if not chunks:
-        return base_points
-    fused = np.concatenate(chunks, axis=0)
-    fused = voxel_downsample(fused, float(temporal_cfg.get("voxel_size_m", 0.06)))
-    max_points = int(temporal_cfg.get("max_points_after_fusion", 20000))
-    if max_points > 0 and fused.shape[0] > max_points:
-        sample_indices = np.linspace(0, fused.shape[0] - 1, num=max_points, dtype=np.int32)
-        fused = fused[sample_indices]
-    return fused
-
-
-class CenterPointCandidateProvider:
-    def __init__(self, config: dict[str, Any]) -> None:
-        detector_cfg = config.get("detector", {})
-        centerpoint_cfg = detector_cfg.get("centerpoint", {})
-        self.enabled = bool(detector_cfg.get("enabled", False)) and str(detector_cfg.get("source", "cluster")) in {"centerpoint", "hybrid"}
-        self.source_mode = str(detector_cfg.get("source", "cluster"))
-        self.provider = str(centerpoint_cfg.get("provider", "none")).lower()
-        self.person_label_ids = {int(v) for v in centerpoint_cfg.get("person_label_ids", [0])}
-        self.score_threshold = float(centerpoint_cfg.get("score_threshold", 0.2))
-        self._module_fn = None
-        self._mmdet_model = None
-        self.load_error: str | None = None
-
-        if not self.enabled:
-            return
-        try:
-            if self.provider == "python_module":
-                module_path = Path(str(centerpoint_cfg.get("module_path", "")))
-                function_name = str(centerpoint_cfg.get("function_name", "infer"))
-                if not module_path.exists():
-                    raise RuntimeError(f"centerpoint module not found: {module_path}")
-                spec = importlib.util.spec_from_file_location("centerpoint_external_module", str(module_path))
-                if spec is None or spec.loader is None:
-                    raise RuntimeError(f"failed to load module spec: {module_path}")
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                fn = getattr(module, function_name, None)
-                if fn is None:
-                    raise RuntimeError(f"function '{function_name}' not found in {module_path}")
-                self._module_fn = fn
-            elif self.provider == "mmdet3d":
-                from mmdet3d.apis import inference_detector, init_model  # type: ignore
-
-                config_path = str(centerpoint_cfg.get("config_path", ""))
-                checkpoint_path = str(centerpoint_cfg.get("checkpoint_path", ""))
-                device = str(centerpoint_cfg.get("device", "cuda:0"))
-                if not config_path or not checkpoint_path:
-                    raise RuntimeError("centerpoint mmdet3d requires config_path and checkpoint_path")
-                self._mmdet_model = {
-                    "model": init_model(config_path, checkpoint_path, device=device),
-                    "infer": inference_detector,
-                }
-            else:
-                raise RuntimeError(f"unsupported centerpoint provider: {self.provider}")
-        except Exception as exc:
-            self.load_error = str(exc)
-            self.enabled = False
-
-    def _from_box(self, index: int, center_xyz: np.ndarray, size_xyz: np.ndarray, score: float) -> ClusterCandidate:
-        center = np.asarray(center_xyz, dtype=np.float64).reshape(3)
-        size = np.asarray(size_xyz, dtype=np.float64).reshape(3)
-        half = size / 2.0
-        min_bound = center - half
-        max_bound = center + half
-        footpoint = center.copy()
-        footpoint[2] = center[2] - half[2]
-        return ClusterCandidate(
-            cluster_id=100000 + int(index),
-            point_count=0,
-            centroid=center,
-            footpoint=footpoint,
-            size=size,
-            min_bound=min_bound,
-            max_bound=max_bound,
-            score=float(score),
-        )
-
-    def _parse_mmdet3d_result(self, result: Any) -> list[ClusterCandidate]:
-        data = result
-        if isinstance(result, tuple) and result:
-            data = result[0]
-        if isinstance(data, list) and data:
-            data = data[0]
-        if isinstance(data, dict) and "pred_instances_3d" in data:
-            pred = data["pred_instances_3d"]
-            boxes = getattr(pred, "bboxes_3d", None)
-            scores = getattr(pred, "scores_3d", None)
-            labels = getattr(pred, "labels_3d", None)
-            if boxes is None:
-                return []
-            box_tensor = boxes.tensor.detach().cpu().numpy()
-            score_arr = scores.detach().cpu().numpy() if scores is not None else np.ones((box_tensor.shape[0],), dtype=np.float64)
-            label_arr = labels.detach().cpu().numpy() if labels is not None else np.zeros((box_tensor.shape[0],), dtype=np.int32)
-        elif isinstance(data, dict) and "pts_bbox" in data:
-            pts = data["pts_bbox"]
-            boxes = pts.get("boxes_3d")
-            scores = pts.get("scores_3d")
-            labels = pts.get("labels_3d")
-            if boxes is None:
-                return []
-            box_tensor = boxes.tensor.detach().cpu().numpy()
-            score_arr = scores.detach().cpu().numpy() if scores is not None else np.ones((box_tensor.shape[0],), dtype=np.float64)
-            label_arr = labels.detach().cpu().numpy() if labels is not None else np.zeros((box_tensor.shape[0],), dtype=np.int32)
-        else:
-            return []
-
-        out: list[ClusterCandidate] = []
-        for i in range(box_tensor.shape[0]):
-            score = float(score_arr[i])
-            label = int(label_arr[i])
-            if score < self.score_threshold or label not in self.person_label_ids:
-                continue
-            center = box_tensor[i, 0:3]
-            size = box_tensor[i, 3:6]
-            out.append(self._from_box(i, center, size, score))
-        return out
-
-    def detect(self, points_xyz: np.ndarray, timestamp: float) -> list[ClusterCandidate]:
-        if not self.enabled or points_xyz.size == 0:
-            return []
-        try:
-            if self.provider == "python_module":
-                rows = self._module_fn(points_xyz, timestamp)  # type: ignore[misc]
-                candidates: list[ClusterCandidate] = []
-                for i, row in enumerate(rows or []):
-                    score = float(row.get("score", 1.0))
-                    label = int(row.get("label", 0))
-                    if score < self.score_threshold or label not in self.person_label_ids:
-                        continue
-                    center = np.asarray(row["center_lidar_m"], dtype=np.float64)
-                    size = np.asarray(row["size_lidar_m"], dtype=np.float64)
-                    candidates.append(self._from_box(i, center, size, score))
-                return candidates
-            if self.provider == "mmdet3d":
-                infer = self._mmdet_model["infer"]
-                model = self._mmdet_model["model"]
-                points = np.concatenate([points_xyz, np.zeros((points_xyz.shape[0], 1), dtype=np.float32)], axis=1).astype(np.float32)
-                result = infer(model, points)
-                return self._parse_mmdet3d_result(result)
-        except Exception as exc:
-            self.load_error = str(exc)
-        return []
-
-
 class ArucoPriorProvider:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         self.context = build_detector_context(config)
         self.frame_source = FrameSource(config)
         tracking_cfg = config.get("tracking", {})
+        self.target_id_groups = get_target_id_groups(tracking_cfg)
         self.target_ids = get_target_ids(tracking_cfg)
         self.target_offsets = get_target_offsets(tracking_cfg, self.target_ids)
-        self.target_label = target_ids_label(self.target_ids)
+        self.target_label = target_ids_label(self.target_id_groups)
         self.tracker = TargetTracker(
             history_size=int(tracking_cfg.get("history_size", 10)),
             max_prediction_duration_s=float(tracking_cfg.get("max_prediction_duration_s", 1.0)),
@@ -688,6 +627,7 @@ class ArucoPriorProvider:
         self.latest_results: list[dict[str, Any]] = []
         self.latest_tracking_state: Any = None
         self.latest_target_result: dict[str, Any] | None = None
+        self.latest_target_results: list[dict[str, Any]] = []
         self.segmentation_predictor = SegmentationPredictor(config)
         self.segmentation_cfg = config.get("segmentation", {})
         self.latest_segmentation: Any = None
@@ -722,8 +662,10 @@ class ArucoPriorProvider:
             self.latest_frame = frame.copy()
             results = detect_markers(frame, self.context)
             self.latest_results = results
-            target = select_target(results, self.target_ids, self.target_offsets)
+            target_results = select_targets(results, self.target_id_groups, self.target_offsets)
+            target = None if not target_results else max(target_results, key=lambda item: (len(item.get("visible_ids", [])), len(item.get("target_ids", []))))
             self.latest_target_result = target
+            self.latest_target_results = target_results
             self.latest_segmentation = self.segmentation_predictor.predict(frame)
             (
                 self.latest_target_person_mask,
@@ -732,7 +674,7 @@ class ArucoPriorProvider:
             ) = select_target_person_mask(
                 frame=frame,
                 segmentation=self.latest_segmentation,
-                target_result=target,
+                target_results=target_results,
                 person_class_id=self.segmentation_predictor.person_class_id,
                 min_area_px=int(self.segmentation_cfg.get("min_person_mask_area_px", 3000)),
                 max_instances=int(self.segmentation_cfg.get("max_instances_considered", 3)),
@@ -750,25 +692,32 @@ class ArucoPriorProvider:
                 self.latest_visible = False
 
     def get_prior(self, timestamp: float) -> ArucoPrior | None:
+        priors = self.get_priors(timestamp)
+        return None if not priors else priors[0]
+
+    def get_priors(self, timestamp: float) -> list[ArucoPrior]:
         self._consume_until(timestamp)
         if self.latest_timestamp is None:
             self.latest_sync_dt_ms = None
-            return None
+            return []
         dt_s = float(self.latest_timestamp - timestamp)
         if abs(dt_s) > self.sync_max_dt_s:
             self.latest_sync_dt_ms = None
-            return None
+            return []
         self.latest_sync_dt_ms = 1000.0 * dt_s
 
-        if self.latest_visible and self.tracker.last_observed is not None:
-            observed = self.tracker.last_observed
-            return ArucoPrior(
-                timestamp=float(observed.timestamp),
-                visible=True,
-                source="observed",
-                position_lidar=np.asarray(observed.position_target, dtype=np.float64).copy(),
+        priors: list[ArucoPrior] = []
+        for target in self.latest_target_results:
+            position_target = np.asarray(target.get("center_in_target_m", np.zeros(3, dtype=np.float64)), dtype=np.float64).reshape(3)
+            priors.append(
+                ArucoPrior(
+                    timestamp=float(self.latest_timestamp),
+                    visible=True,
+                    source=f"observed_group_{int(target.get('target_group_index', -1))}",
+                    position_lidar=position_target.copy(),
+                )
             )
-        return None
+        return priors
 
     def release(self) -> None:
         self.frame_source.release()
@@ -781,6 +730,7 @@ class ArucoPriorProvider:
             results=list(self.latest_results),
             tracking_state=self.latest_tracking_state,
             target_result=self.latest_target_result,
+            target_results=[dict(item) for item in self.latest_target_results],
             segmentation=None if self.latest_segmentation is None else self.latest_segmentation.copy(),
             target_person_mask=None if self.latest_target_person_mask is None else self.latest_target_person_mask.copy(),
             selected_person_masks=[mask.copy() for mask in self.latest_selected_person_masks],
@@ -791,12 +741,12 @@ class ArucoPriorProvider:
 def select_target_person_mask(
     frame: np.ndarray,
     segmentation: Any,
-    target_result: dict[str, Any] | None,
+    target_results: list[dict[str, Any]],
     person_class_id: int = 19,
     min_area_px: int = 0,
     max_instances: int | None = None,
 ) -> tuple[np.ndarray | None, list[np.ndarray], int]:
-    if segmentation is None or target_result is None:
+    if segmentation is None or not target_results:
         return None, [], 0
 
     split_mode = "none" if isinstance(segmentation, dict) else "auto"
@@ -811,25 +761,38 @@ def select_target_person_mask(
     if not person_masks:
         return None, [], raw_person_mask_count
 
-    center = np.round(target_result["center_projected_px"]).astype(int)
     h, w = frame.shape[:2]
-    cx = int(np.clip(center[0], 0, w - 1))
-    cy = int(np.clip(center[1], 0, h - 1))
-    best_mask = None
-    best_distance = None
-    for mask in person_masks:
-        mask = np.asarray(mask, dtype=bool)
-        if mask[cy, cx]:
-            return mask, person_masks, raw_person_mask_count
-        ys, xs = np.where(mask)
-        if xs.size == 0:
-            continue
-        distances = (xs - cx) ** 2 + (ys - cy) ** 2
-        nearest_distance = float(np.min(distances))
-        if best_mask is None or nearest_distance < best_distance:
-            best_mask = mask
-            best_distance = nearest_distance
-    return best_mask, person_masks, raw_person_mask_count
+    target_centers: list[tuple[int, int]] = []
+    for target_result in target_results:
+        center = np.round(target_result["center_projected_px"]).astype(int)
+        cx = int(np.clip(center[0], 0, w - 1))
+        cy = int(np.clip(center[1], 0, h - 1))
+        target_centers.append((cx, cy))
+
+    selected_masks: list[np.ndarray] = []
+    for cx, cy in target_centers:
+        best_mask = None
+        best_distance = None
+        for mask in person_masks:
+            mask = np.asarray(mask, dtype=bool)
+            if mask[cy, cx]:
+                best_mask = mask
+                break
+            ys, xs = np.where(mask)
+            if xs.size == 0:
+                continue
+            distances = (xs - cx) ** 2 + (ys - cy) ** 2
+            nearest_distance = float(np.min(distances))
+            if best_mask is None or nearest_distance < best_distance:
+                best_mask = mask
+                best_distance = nearest_distance
+        if best_mask is not None:
+            selected_masks.append(best_mask)
+
+    if not selected_masks:
+        return None, person_masks, raw_person_mask_count
+    merged_mask = np.any(np.stack(selected_masks, axis=0), axis=0)
+    return merged_mask, person_masks, raw_person_mask_count
 
 
 def overlay_target_mask(frame: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
@@ -851,7 +814,7 @@ class FusionDebugWriter:
         self.output_dir = Path(str(debug_cfg.get("fusion_output_dir", "outputs/fusion_debug")))
         self.tile_width = int(debug_cfg.get("image_width", 1200))
         self.tile_height = int(debug_cfg.get("image_height", 900))
-        self.target_label = target_ids_label(get_target_ids(tracking_cfg))
+        self.target_label = target_ids_label(get_target_id_groups(tracking_cfg))
         if self.enabled:
             for subdir in [
                 "front_camera",
@@ -903,7 +866,8 @@ class FusionDebugWriter:
         vis = overlay_target_mask(aruco_debug.frame, aruco_debug.target_person_mask)
         vis = draw_results(vis, aruco_debug.results, aruco_context)
         visible_ids = [] if aruco_debug.target_result is None else list(aruco_debug.target_result.get("visible_ids", []))
-        vis = draw_tracking_overlay(vis, self.target_label, aruco_debug.tracking_state, visible_ids)
+        selected_target_ids = [] if aruco_debug.target_result is None else list(aruco_debug.target_result.get("target_ids", []))
+        vis = draw_tracking_overlay(vis, self.target_label, aruco_debug.tracking_state, visible_ids, selected_target_ids)
         vis = cv2.resize(vis, (self.tile_width, self.tile_height), interpolation=cv2.INTER_LINEAR)
         frame_ts_text = "none" if aruco_debug.frame_timestamp is None else f"{aruco_debug.frame_timestamp:.3f}"
         sync_dt_text = "none" if aruco_debug.sync_dt_ms is None else f"{aruco_debug.sync_dt_ms:.1f}"
@@ -1131,7 +1095,7 @@ class FusionDebugWriter:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fuse ArUco target prior with lidar person-cluster tracking.")
+    parser = argparse.ArgumentParser(description="Track target from lidar points projected into the ArUco target mask.")
     parser.add_argument("--aruco-config", default="configs/aruco_config.yaml", help="Path to ArUco YAML config.")
     parser.add_argument("--lidar-config", default="configs/lidar_config.yaml", help="Path to lidar YAML config.")
     parser.add_argument(
@@ -1147,8 +1111,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ie-path",
-        default="data/2026-04-14_mongkok-opensky-walk-006/raw/novatel/ie/ie.txt",
-        help="Path to IE/SPAN text file for world-frame lidar pose.",
+        default=None,
+        help="Path to IE/SPAN/GT text file for world-frame lidar pose. If omitted, read from lidar config ie_pose.path.",
     )
     parser.add_argument(
         "--output-target-world-json",
@@ -1200,78 +1164,6 @@ def select_candidate_with_aruco_prior(
     if best_candidate is None or best_combined_score < min_combined_score:
         return None
     return best_candidate
-
-
-def nearest_candidate_distance(
-    candidates: list[ClusterCandidate],
-    aruco_prior: ArucoPrior | None,
-) -> float | None:
-    if aruco_prior is None or not candidates:
-        return None
-    return min(float(np.linalg.norm(candidate.footpoint[:2] - aruco_prior.position_lidar[:2])) for candidate in candidates)
-
-
-def merge_prioritized_candidates(
-    segmentation_candidates: list[ClusterCandidate],
-    candidates: list[ClusterCandidate],
-    dedup_distance_m: float = 0.2,
-) -> list[ClusterCandidate]:
-    merged: list[ClusterCandidate] = list(segmentation_candidates)
-    for candidate in candidates:
-        duplicate = any(
-            float(np.linalg.norm(existing.footpoint[:2] - candidate.footpoint[:2])) <= dedup_distance_m
-            for existing in merged
-        )
-        if not duplicate:
-            merged.append(candidate)
-    return merged
-
-
-def select_lidar_candidates(
-    source_mode: str,
-    geometric_candidates: list[ClusterCandidate],
-    centerpoint_candidates: list[ClusterCandidate],
-    dedup_distance_m: float = 0.4,
-) -> tuple[list[ClusterCandidate], str]:
-    mode = source_mode.lower()
-    if mode == "centerpoint":
-        if centerpoint_candidates:
-            return centerpoint_candidates, "centerpoint"
-        return geometric_candidates, "cluster_fallback"
-    if mode == "hybrid":
-        merged = merge_prioritized_candidates(
-            segmentation_candidates=centerpoint_candidates,
-            candidates=geometric_candidates,
-            dedup_distance_m=dedup_distance_m,
-        )
-        return merged, "hybrid"
-    return geometric_candidates, "cluster"
-
-
-def build_aruco_rescue_candidates(
-    clusters: list[np.ndarray],
-    person_cfg: dict[str, Any],
-    aruco_prior: ArucoPrior | None,
-) -> list[ClusterCandidate]:
-    if aruco_prior is None:
-        return []
-    rescue_cfg = dict(person_cfg)
-    if "min_points_with_aruco" in person_cfg:
-        rescue_cfg["min_points"] = int(person_cfg["min_points_with_aruco"])
-    if "height_m_with_aruco" in person_cfg:
-        rescue_cfg["height_m"] = person_cfg["height_m_with_aruco"]
-    if "width_m_with_aruco" in person_cfg:
-        rescue_cfg["width_m"] = person_cfg["width_m_with_aruco"]
-    if "depth_m_with_aruco" in person_cfg:
-        rescue_cfg["depth_m"] = person_cfg["depth_m_with_aruco"]
-
-    relaxed = filter_candidates(clusters, rescue_cfg)
-    max_distance_m = float(person_cfg.get("aruco_rescue_distance_m", 1.2))
-    return [
-        candidate
-        for candidate in relaxed
-        if float(np.linalg.norm(candidate.footpoint[:2] - aruco_prior.position_lidar[:2])) <= max_distance_m
-    ]
 
 
 def build_target_mask_v2_candidates(
@@ -1474,11 +1366,12 @@ def select_points_in_target_mask(
 def apply_aruco_local_roi(
     points: np.ndarray,
     aruco_prior: ArucoPrior | None,
+    aruco_target_centers: list[np.ndarray] | None,
     roi_cfg: dict[str, Any],
     reconnect_streak: int = 0,
     force_disable: bool = False,
 ) -> np.ndarray:
-    if points.size == 0 or aruco_prior is None:
+    if points.size == 0:
         return points
     local_cfg = roi_cfg.get("local_with_aruco", {})
     if force_disable or not bool(local_cfg.get("enabled", False)):
@@ -1494,15 +1387,25 @@ def apply_aruco_local_roi(
         half_y = float(local_cfg.get("expanded_half_height_m", half_y))
         z_min_offset = float(local_cfg.get("expanded_z_min_offset_m", z_min_offset))
         z_max_offset = float(local_cfg.get("expanded_z_max_offset_m", z_max_offset))
-    center = aruco_prior.position_lidar
-    mask = (
-        (points[:, 0] >= center[0] - half_x)
-        & (points[:, 0] <= center[0] + half_x)
-        & (points[:, 1] >= center[1] - half_y)
-        & (points[:, 1] <= center[1] + half_y)
-        & (points[:, 2] >= center[2] + z_min_offset)
-        & (points[:, 2] <= center[2] + z_max_offset)
-    )
+    centers: list[np.ndarray] = []
+    if aruco_target_centers:
+        centers.extend([np.asarray(center, dtype=np.float64).reshape(3) for center in aruco_target_centers])
+    if aruco_prior is not None:
+        centers.append(np.asarray(aruco_prior.position_lidar, dtype=np.float64).reshape(3))
+    if not centers:
+        return points
+
+    mask = np.zeros((points.shape[0],), dtype=bool)
+    for center in centers:
+        center_mask = (
+            (points[:, 0] >= center[0] - half_x)
+            & (points[:, 0] <= center[0] + half_x)
+            & (points[:, 1] >= center[1] - half_y)
+            & (points[:, 1] <= center[1] + half_y)
+            & (points[:, 2] >= center[2] + z_min_offset)
+            & (points[:, 2] <= center[2] + z_max_offset)
+        )
+        mask |= center_mask
     cropped = points[mask]
     min_points_keep = int(local_cfg.get("min_points_after_crop", 180))
     if cropped.shape[0] < min_points_keep:
@@ -1520,26 +1423,19 @@ def format_fusion_record(
     point_count_after_aruco_local_roi: int,
     point_count_filtered: int,
     candidates: list[ClusterCandidate],
-    geometric_candidates: list[ClusterCandidate],
-    centerpoint_candidates: list[ClusterCandidate],
-    candidate_source: str,
-    segmentation_candidates: list[ClusterCandidate],
-    aruco_rescue_candidates: list[ClusterCandidate],
-    prioritized_candidates: list[ClusterCandidate],
     tracker_candidates: list[ClusterCandidate],
     candidate_diagnostics: list[dict[str, Any]],
-    cluster_count: int,
     segmentation_cluster_count: int,
     aruco_prior: ArucoPrior | None,
     aruco_selected_candidate: ClusterCandidate | None,
-    aruco_nearest_distance_m: float | None,
     camera_timestamp: float | None,
     sync_dt_ms: float | None,
     segmentation_point_count: int,
     projected_point_count: int,
-    segmentation_candidate_count: int,
+    aruco_priors: list[ArucoPrior],
     used_aruco_fallback: bool,
     state: Any,
+    multi_tracks: list[MultiTrack],
 ) -> dict[str, Any]:
     iso_time = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat()
     return {
@@ -1555,22 +1451,10 @@ def format_fusion_record(
         "sync_dt_ms": None if sync_dt_ms is None else round(float(sync_dt_ms), 3),
         "point_count_projected_to_front": projected_point_count,
         "point_count_in_target_mask": segmentation_point_count,
-        "cluster_count": int(cluster_count),
         "segmentation_cluster_count": int(segmentation_cluster_count),
-        "candidate_source": str(candidate_source),
         "candidate_count": len(candidates),
-        "candidate_count_geometric": len(geometric_candidates),
-        "candidate_count_centerpoint": len(centerpoint_candidates),
-        "candidate_count_segmentation": len(segmentation_candidates),
-        "candidate_count_aruco_rescue": len(aruco_rescue_candidates),
-        "candidate_count_prioritized": len(prioritized_candidates),
         "candidate_count_tracker_input": len(tracker_candidates),
         "candidates": [format_candidate(candidate) for candidate in candidates],
-        "geometric_candidates": [format_candidate(candidate) for candidate in geometric_candidates],
-        "centerpoint_candidates": [format_candidate(candidate) for candidate in centerpoint_candidates],
-        "segmentation_candidates": [format_candidate(candidate) for candidate in segmentation_candidates],
-        "aruco_rescue_candidates": [format_candidate(candidate) for candidate in aruco_rescue_candidates],
-        "prioritized_candidates": [format_candidate(candidate) for candidate in prioritized_candidates],
         "tracker_input_candidates": [format_candidate(candidate) for candidate in tracker_candidates],
         "candidate_diagnostics": candidate_diagnostics,
         "aruco_prior": None
@@ -1580,9 +1464,17 @@ def format_fusion_record(
             "visible": aruco_prior.visible,
             "source": aruco_prior.source,
             "position_lidar_m": np.round(aruco_prior.position_lidar, 6).tolist(),
-            "nearest_candidate_distance_m": None if aruco_nearest_distance_m is None else round(float(aruco_nearest_distance_m), 6),
-            "segmentation_candidate_count": segmentation_candidate_count,
+            "candidate_count": len(candidates),
         },
+        "aruco_priors": [
+            {
+                "timestamp": round(float(prior.timestamp), 6),
+                "visible": bool(prior.visible),
+                "source": str(prior.source),
+                "position_lidar_m": np.round(prior.position_lidar, 6).tolist(),
+            }
+            for prior in aruco_priors
+        ],
         "aruco_selected_candidate": None if aruco_selected_candidate is None else format_candidate(aruco_selected_candidate),
         "used_aruco_fallback": bool(used_aruco_fallback),
         "track": None
@@ -1595,6 +1487,20 @@ def format_fusion_record(
             "velocity_lidar_mps": np.round(state.velocity, 6).tolist(),
             "selected_candidate": None if state.candidate is None else format_candidate(state.candidate),
         },
+        "multi_tracks": [
+            {
+                "track_id": int(track.track_id),
+                "state": track.state.source,
+                "lifecycle": track.state.track_lifecycle,
+                "quality": round(float(track.state.track_quality), 6),
+                "hits": int(track.hits),
+                "misses": int(track.misses),
+                "position_lidar_m": np.round(track.state.position, 6).tolist(),
+                "velocity_lidar_mps": np.round(track.state.velocity, 6).tolist(),
+                "selected_candidate": None if track.state.candidate is None else format_candidate(track.state.candidate),
+            }
+            for track in multi_tracks
+        ],
     }
 
 
@@ -1613,7 +1519,6 @@ def main() -> None:
     clustering_cfg = lidar_config["clustering"]
     tracker_cfg = lidar_config["tracker"]
     logging_cfg = lidar_config.get("logging", {})
-    temporal_cfg = lidar_config.get("temporal_fusion", {})
 
     tracker = SimpleTracker(
         gating_distance_m=float(tracker_cfg.get("gating_distance_m", 1.0)),
@@ -1625,12 +1530,16 @@ def main() -> None:
         quality_hit_gain=float(tracker_cfg.get("quality_hit_gain", 0.2)),
         quality_miss_decay=float(tracker_cfg.get("quality_miss_decay", 0.85)),
     )
-    centerpoint_provider = CenterPointCandidateProvider(lidar_config)
-    detector_cfg = lidar_config.get("detector", {})
-    detector_source_mode = str(detector_cfg.get("source", "cluster"))
-    detector_dedup_distance_m = float(detector_cfg.get("dedup_distance_m", 0.4))
-    if bool(logging_cfg.get("print_summary_every_frame", False)) and centerpoint_provider.load_error is not None:
-        print(f"CenterPoint provider unavailable; fallback to cluster candidates. reason={centerpoint_provider.load_error}")
+    multi_tracker = MultiObjectTracker(
+        gating_distance_m=float(tracker_cfg.get("multi_gating_distance_m", tracker_cfg.get("gating_distance_m", 1.0))),
+        max_prediction_duration_s=float(
+            tracker_cfg.get("multi_max_prediction_duration_s", tracker_cfg.get("max_prediction_duration_s", 0.5))
+        ),
+        process_gain=float(tracker_cfg.get("multi_process_gain", tracker_cfg.get("process_gain", 0.6))),
+        allow_prediction=bool(tracker_cfg.get("multi_allow_prediction", tracker_cfg.get("allow_prediction", False))),
+        confirm_hits=int(tracker_cfg.get("multi_confirm_hits", tracker_cfg.get("confirm_hits", 3))),
+        forget_misses=int(tracker_cfg.get("multi_forget_misses", tracker_cfg.get("forget_misses", 8))),
+    )
     debug_writer = FusionDebugWriter(
         {
             "debug": lidar_config.get("debug", {}),
@@ -1641,7 +1550,12 @@ def main() -> None:
         output_path=Path(str(args.output_json)),
         flush_every_frame=bool(logging_cfg.get("flush_every_frame", True)),
     )
-    ie_pose_provider = IePoseProvider(load_ie_poses(Path(str(args.ie_path))))
+    ie_cfg = dict(lidar_config.get("ie_pose", {}))
+    ie_path_value = args.ie_path if args.ie_path is not None else ie_cfg.get(
+        "path",
+        "data/2026-04-14_mongkok-opensky-walk-006/raw/novatel/ie/ie.txt",
+    )
+    ie_pose_provider = IePoseProvider(load_ie_poses(Path(str(ie_path_value))))
     target_world_writer = TargetWorldWriter(Path(str(args.output_target_world_json)))
     enu_origin_pose = ie_pose_provider.poses[0] if ie_pose_provider.available else None
     ecef_origin = None if enu_origin_pose is None else _geodetic_to_ecef(
@@ -1659,79 +1573,42 @@ def main() -> None:
     reconnect_streak = 0
     local_roi_recovery_countdown = 0
 
-    raw_points_per_frame: list[np.ndarray] = []
-    timestamps: list[float] = []
-    while True:
-        ok, points, timestamp = lidar_source.read()
-        if not ok or points is None or timestamp is None:
-            break
-        raw_points_per_frame.append(points)
-        timestamps.append(float(timestamp))
-
-    ie_poses_per_frame = [ie_pose_provider.get_interpolated(ts) for ts in timestamps]
-
     try:
-        for frame_index, timestamp in enumerate(timestamps):
-            points = temporal_fuse_points(
-                frame_index=frame_index,
-                points_per_frame=raw_points_per_frame,
-                timestamps=timestamps,
-                temporal_cfg=temporal_cfg,
-                ie_poses_per_frame=ie_poses_per_frame,
-                ecef_origin=ecef_origin,
-                enu_from_ecef=enu_from_ecef,
-            )
-
+        while True:
+            ok, points, timestamp = lidar_source.read()
+            if not ok or points is None or timestamp is None:
+                break
+            timestamp = float(timestamp)
             raw_count = int(points.shape[0])
             roi_points = crop_points(points, lidar_config.get("roi", {}))
             point_count_after_roi = int(roi_points.shape[0])
             no_ego_points = remove_ego_vehicle_points(roi_points, lidar_config.get("ego_vehicle_filter", {}))
             point_count_after_ego_filter = int(no_ego_points.shape[0])
-            aruco_prior = aruco_provider.get_prior(timestamp)
+            aruco_priors = aruco_provider.get_priors(timestamp)
+            aruco_prior = None if not aruco_priors else aruco_priors[0]
             aruco_debug = aruco_provider.get_debug_state()
             ground_cfg = dict(lidar_config.get("ground_removal", {}))
-            protect_regions = build_ground_protect_regions(tracker, aruco_prior, ground_cfg)
+            protect_regions = build_ground_protect_regions(tracker, aruco_priors, ground_cfg)
             if protect_regions:
                 ground_cfg["protect_regions"] = protect_regions
             processed = remove_ground(no_ego_points, ground_cfg)
             point_count_after_ground_removal = int(processed.shape[0])
             use_local_roi = local_roi_recovery_countdown <= 0
+            aruco_target_centers = [
+                np.asarray(target["center_in_target_m"], dtype=np.float64)
+                for target in aruco_debug.target_results
+                if "center_in_target_m" in target
+            ]
             processed = apply_aruco_local_roi(
                 processed,
                 aruco_prior,
+                aruco_target_centers,
                 lidar_config.get("roi", {}),
                 reconnect_streak=reconnect_streak,
                 force_disable=not use_local_roi,
             )
             point_count_after_aruco_local_roi = int(processed.shape[0])
 
-            clusters = euclidean_clusters(
-                points=processed,
-                tolerance=float(clustering_cfg["tolerance_m"]),
-                min_points=int(clustering_cfg["min_cluster_points"]),
-                max_points=int(clustering_cfg["max_cluster_points"]),
-            )
-            clusters = merge_vertical_person_clusters(
-                clusters,
-                xy_merge_distance_m=float(clustering_cfg.get("merge_xy_distance_m", 0.55)),
-                z_gap_m=float(clustering_cfg.get("merge_z_gap_m", 0.9)),
-                max_merged_points=int(clustering_cfg.get("merge_max_points", 8000)),
-            )
-            cluster_count = len(clusters)
-            geometric_candidates = filter_candidates(clusters, lidar_config["person_cluster"])
-            centerpoint_candidates = centerpoint_provider.detect(processed, timestamp)
-            candidates, candidate_source = select_lidar_candidates(
-                source_mode=detector_source_mode,
-                geometric_candidates=geometric_candidates,
-                centerpoint_candidates=centerpoint_candidates,
-                dedup_distance_m=detector_dedup_distance_m,
-            )
-
-            aruco_rescue_candidates = build_aruco_rescue_candidates(
-                clusters=clusters,
-                person_cfg=lidar_config["person_cluster"],
-                aruco_prior=aruco_prior,
-            )
             segmented_points, projected_point_count = select_points_in_target_mask(
                 points=processed,
                 aruco_debug=aruco_debug,
@@ -1750,37 +1627,18 @@ def main() -> None:
                 max_merged_points=int(clustering_cfg.get("merge_max_points", 8000)),
             ) if segmented_clusters else []
             segmentation_cluster_count = len(segmented_clusters)
-            segmentation_candidates = filter_candidates(segmented_clusters, lidar_config["person_cluster"])
-            detector_mode = detector_source_mode.lower()
-            if detector_mode == "aruco_mask_v2":
-                candidates = build_target_mask_v2_candidates(segmented_clusters, lidar_config["person_cluster"])
-                candidate_source = "aruco_mask_v2"
-                prioritized_candidates = list(candidates)
-            else:
-                prioritized_candidates = []
-                if aruco_prior is not None:
-                    prioritized_candidates = merge_prioritized_candidates(
-                        segmentation_candidates=segmentation_candidates,
-                        candidates=merge_prioritized_candidates(
-                            segmentation_candidates=aruco_rescue_candidates,
-                            candidates=candidates,
-                            dedup_distance_m=float(lidar_config.get("segmentation", {}).get("candidate_dedup_distance_m", 0.2)),
-                        ),
-                        dedup_distance_m=float(lidar_config.get("segmentation", {}).get("candidate_dedup_distance_m", 0.2)),
-                    )
-            aruco_nearest_distance_m = nearest_candidate_distance(candidates, aruco_prior)
-            rescue_candidate_keys = {candidate_key(candidate) for candidate in aruco_rescue_candidates}
+            candidates = build_target_mask_v2_candidates(segmented_clusters, lidar_config["person_cluster"])
 
             def motion_cfg_for(candidate: ClusterCandidate) -> dict[str, Any]:
                 return build_motion_cfg(
                     tracker_cfg=tracker_cfg,
                     aruco_prior=aruco_prior,
                     reconnect_streak=reconnect_streak,
-                    is_rescue_candidate=candidate_key(candidate) in rescue_candidate_keys,
+                    is_rescue_candidate=False,
                 )
 
             aruco_selected_candidate = select_candidate_with_aruco_prior(
-                candidates=prioritized_candidates,
+                candidates=candidates,
                 aruco_prior=aruco_prior,
                 gating_distance_m=float(args.aruco_gating_distance),
                 tracker_state=tracker.last_state,
@@ -1800,7 +1658,7 @@ def main() -> None:
             else:
                 tracker_candidates = [
                     candidate
-                    for candidate in prioritized_candidates
+                    for candidate in candidates
                     if is_candidate_motion_consistent(
                         candidate=candidate,
                         last_state=tracker.last_state,
@@ -1811,10 +1669,8 @@ def main() -> None:
                 ]
             tracker_candidate_keys = {candidate_key(candidate) for candidate in tracker_candidates}
             aruco_selected_key = None if aruco_selected_candidate is None else candidate_key(aruco_selected_candidate)
-            geo_candidate_keys = {candidate_key(candidate) for candidate in candidates}
-            seg_candidate_keys = {candidate_key(candidate) for candidate in segmentation_candidates}
             candidate_diagnostics: list[dict[str, Any]] = []
-            for candidate in prioritized_candidates:
+            for candidate in candidates:
                 key = candidate_key(candidate)
                 reject_reason = candidate_motion_reject_reason(
                     candidate=candidate,
@@ -1829,9 +1685,7 @@ def main() -> None:
                 candidate_diagnostics.append(
                     {
                         "candidate": format_candidate(candidate),
-                        "source_geometric": key in geo_candidate_keys,
-                        "source_segmentation": key in seg_candidate_keys,
-                        "source_aruco_rescue": key in rescue_candidate_keys,
+                        "source_target_mask_v2": True,
                         "distance_to_aruco_m": None if distance_to_aruco_m is None else round(distance_to_aruco_m, 6),
                         "is_aruco_selected": key == aruco_selected_key,
                         "is_tracker_input": key in tracker_candidate_keys,
@@ -1891,6 +1745,8 @@ def main() -> None:
             else:
                 reconnect_streak = 0
 
+            multi_tracks = multi_tracker.update(timestamp=timestamp, candidates=candidates)
+
             debug_writer.write(
                 frame_index=frame_index,
                 timestamp=timestamp,
@@ -1914,35 +1770,28 @@ def main() -> None:
                 point_count_after_aruco_local_roi=point_count_after_aruco_local_roi,
                 point_count_filtered=int(processed.shape[0]),
                 candidates=candidates,
-                geometric_candidates=geometric_candidates,
-                centerpoint_candidates=centerpoint_candidates,
-                candidate_source=candidate_source,
-                segmentation_candidates=segmentation_candidates,
-                aruco_rescue_candidates=aruco_rescue_candidates,
-                prioritized_candidates=prioritized_candidates,
                 tracker_candidates=tracker_candidates,
                 candidate_diagnostics=candidate_diagnostics,
-                cluster_count=cluster_count,
                 segmentation_cluster_count=segmentation_cluster_count,
                 aruco_prior=aruco_prior,
                 aruco_selected_candidate=aruco_selected_candidate,
-                aruco_nearest_distance_m=aruco_nearest_distance_m,
                 camera_timestamp=aruco_debug.frame_timestamp,
                 sync_dt_ms=aruco_debug.sync_dt_ms,
                 segmentation_point_count=int(segmented_points.shape[0]),
                 projected_point_count=int(projected_point_count),
-                segmentation_candidate_count=len(segmentation_candidates),
+                aruco_priors=aruco_priors,
                 used_aruco_fallback=used_aruco_fallback,
                 state=state,
+                multi_tracks=multi_tracks,
             )
             json_writer.append(record)
             ie_pose = ie_pose_provider.get_interpolated(timestamp)
             target_lidar = None if state is None else state.position
             target_body = None if target_lidar is None else lidar_to_ie_body(target_lidar)
-            if aruco_debug.target_result is not None and "id" in aruco_debug.target_result:
-                target_name: Any = aruco_debug.target_result["id"]
+            if aruco_debug.target_results:
+                target_name = [target.get("id") for target in aruco_debug.target_results if "id" in target]
             else:
-                target_name = list(aruco_provider.target_ids)
+                target_name = [list(target_group) for target_group in aruco_provider.target_id_groups]
             world_record: dict[str, Any] = {
                 "timestamp": float(timestamp),
                 "datetime": datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat(),
@@ -1950,6 +1799,8 @@ def main() -> None:
                 "target_lidar_m": None if target_lidar is None else np.round(target_lidar, 6).tolist(),
                 "target_world_lla": None,
                 "target_world_enu_m": None,
+                "multi_targets": [],
+                "aruco_group_targets": [],
                 "ie_pose": None,
             }
             if ie_pose is not None:
@@ -1980,15 +1831,86 @@ def main() -> None:
                         round(float(target_h), 6),
                     ]
                     world_record["target_world_enu_m"] = np.round(target_enu, 6).tolist()
+                if ecef_origin is not None and enu_from_ecef is not None:
+                    for target in aruco_debug.target_results:
+                        if "center_in_target_m" not in target:
+                            continue
+                        aruco_lidar = np.asarray(target["center_in_target_m"], dtype=np.float64).reshape(3)
+                        aruco_body = lidar_to_ie_body(aruco_lidar)
+                        rot_enu_from_body = rotation_matrix_from_ie(
+                            roll_deg=ie_pose.roll_deg,
+                            pitch_deg=ie_pose.pitch_deg,
+                            heading_deg=ie_pose.heading_deg,
+                        )
+                        lidar_ecef = _geodetic_to_ecef(ie_pose.latitude_deg, ie_pose.longitude_deg, ie_pose.height_m)
+                        aruco_offset_enu = rot_enu_from_body @ aruco_body
+                        enu_to_ecef_aruco = _enu_to_ecef_matrix(ie_pose.latitude_deg, ie_pose.longitude_deg)
+                        aruco_ecef = lidar_ecef + (enu_to_ecef_aruco @ aruco_offset_enu)
+                        aruco_lat, aruco_lon, aruco_h = _ecef_to_geodetic(aruco_ecef)
+                        aruco_enu = enu_from_ecef @ (aruco_ecef - ecef_origin)
+                        world_record["aruco_group_targets"].append(
+                            {
+                                "target_group_index": int(target.get("target_group_index", -1)),
+                                "target_ids": list(target.get("target_ids", [])),
+                                "visible_ids": list(target.get("visible_ids", [])),
+                                "target_lidar_m": np.round(aruco_lidar, 6).tolist(),
+                                "target_world_lla": [
+                                    round(float(aruco_lat), 9),
+                                    round(float(aruco_lon), 9),
+                                    round(float(aruco_h), 6),
+                                ],
+                                "target_world_enu_m": np.round(aruco_enu, 6).tolist(),
+                            }
+                        )
+                    for track in multi_tracks:
+                        target_body_multi = lidar_to_ie_body(track.state.position)
+                        rot_enu_from_body = rotation_matrix_from_ie(
+                            roll_deg=ie_pose.roll_deg,
+                            pitch_deg=ie_pose.pitch_deg,
+                            heading_deg=ie_pose.heading_deg,
+                        )
+                        lidar_ecef = _geodetic_to_ecef(ie_pose.latitude_deg, ie_pose.longitude_deg, ie_pose.height_m)
+                        target_offset_enu_multi = rot_enu_from_body @ target_body_multi
+                        enu_to_ecef_multi = _enu_to_ecef_matrix(ie_pose.latitude_deg, ie_pose.longitude_deg)
+                        target_ecef_multi = lidar_ecef + (enu_to_ecef_multi @ target_offset_enu_multi)
+                        target_lat_multi, target_lon_multi, target_h_multi = _ecef_to_geodetic(target_ecef_multi)
+                        target_enu_multi = enu_from_ecef @ (target_ecef_multi - ecef_origin)
+                        world_record["multi_targets"].append(
+                            {
+                                "track_id": int(track.track_id),
+                                "state": track.state.source,
+                                "lifecycle": track.state.track_lifecycle,
+                                "quality": round(float(track.state.track_quality), 6),
+                                "hits": int(track.hits),
+                                "misses": int(track.misses),
+                                "target_lidar_m": np.round(track.state.position, 6).tolist(),
+                                "target_world_lla": [
+                                    round(float(target_lat_multi), 9),
+                                    round(float(target_lon_multi), 9),
+                                    round(float(target_h_multi), 6),
+                                ],
+                                "target_world_enu_m": np.round(target_enu_multi, 6).tolist(),
+                            }
+                        )
+                    # Backward-compatible single-target mirrors use first multi target when available.
+                    if world_record["multi_targets"]:
+                        first_target = world_record["multi_targets"][0]
+                        world_record["target_lidar_m"] = first_target["target_lidar_m"]
+                        world_record["target_world_lla"] = first_target["target_world_lla"]
+                        world_record["target_world_enu_m"] = first_target["target_world_enu_m"]
+                    elif world_record["aruco_group_targets"]:
+                        first_group_target = world_record["aruco_group_targets"][0]
+                        world_record["target_lidar_m"] = first_group_target["target_lidar_m"]
+                        world_record["target_world_lla"] = first_group_target["target_world_lla"]
+                        world_record["target_world_enu_m"] = first_group_target["target_world_enu_m"]
             target_world_writer.append(world_record)
 
             if bool(logging_cfg.get("print_summary_every_frame", False)):
                 aruco_text = "none"
                 if aruco_prior is not None:
-                    distance_text = "none" if aruco_nearest_distance_m is None else f"{aruco_nearest_distance_m:.3f}"
                     aruco_text = (
                         f"{aruco_prior.source} pos={np.round(aruco_prior.position_lidar, 3).tolist()} "
-                        f"nearest={distance_text} mask_points={segmented_points.shape[0]} "
+                        f"mask_points={segmented_points.shape[0]} "
                         f"sync_dt_ms={aruco_debug.sync_dt_ms if aruco_debug.sync_dt_ms is not None else 'none'}"
                     )
                 fused_text = "none" if state is None else f"{state.source} pos={np.round(state.position, 3).tolist()}"
@@ -2000,11 +1922,13 @@ def main() -> None:
                 fallback_text = "true" if used_aruco_fallback else "false"
                 print(
                     f"time={timestamp:.3f} raw={raw_count} filtered={processed.shape[0]} "
-                    f"candidates={len(candidates)} source={candidate_source} aruco={aruco_text} aruco_match={selected_text} "
-                    f"aruco_fallback={fallback_text} fused={fused_text}"
+                    f"candidates={len(candidates)} aruco={aruco_text} aruco_match={selected_text} "
+                    f"aruco_fallback={fallback_text} fused={fused_text} multi_tracks={len(multi_tracks)}"
                 )
             else:
                 print(json.dumps(record, ensure_ascii=False))
+
+            frame_index += 1
 
     except KeyboardInterrupt:
         interrupted = True

@@ -57,8 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fusion_parser.add_argument(
         "--ie-path",
-        default="data/2026-04-14_mongkok-opensky-walk-006/raw/novatel/ie/ie.txt",
-        help="Path to IE/SPAN text file for world-frame lidar pose.",
+        default=None,
+        help="Optional override path to IE/SPAN/GT text file for world-frame lidar pose.",
     )
     fusion_parser.add_argument(
         "--output-target-world-json",
@@ -99,6 +99,7 @@ def main() -> None:
 
     # Rebuild argv so the delegated entrypoint can keep using its own argparse.
     if args.command == "fusion_tracking":
+        ie_args = [] if args.ie_path is None else ["--ie-path", args.ie_path]
         sys.argv = [
             f"{parser.prog} {args.command}",
             "--aruco-config",
@@ -109,8 +110,7 @@ def main() -> None:
             str(args.aruco_gating_distance),
             "--output-json",
             args.output_json,
-            "--ie-path",
-            args.ie_path,
+            *ie_args,
             "--output-target-world-json",
             args.output_target_world_json,
             *remaining,

@@ -137,14 +137,41 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_target_ids(tracking_cfg: dict[str, Any]) -> list[int]:
+def _normalize_target_id_group(target_ids: Any) -> list[int]:
+    if not isinstance(target_ids, (list, tuple)):
+        return [int(target_ids)]
+    return [int(target_id) for target_id in target_ids]
+
+
+def get_target_id_groups(tracking_cfg: dict[str, Any]) -> list[list[int]]:
+    target_id_groups_cfg = tracking_cfg.get("target_id_groups")
+    if target_id_groups_cfg is not None:
+        return [_normalize_target_id_group(target_ids) for target_ids in target_id_groups_cfg]
+
     target_ids_cfg = tracking_cfg.get("target_ids")
     if target_ids_cfg is not None:
-        return [int(target_id) for target_id in target_ids_cfg]
-    return [int(tracking_cfg["target_id"])]
+        if isinstance(target_ids_cfg, (list, tuple)) and target_ids_cfg and isinstance(target_ids_cfg[0], (list, tuple)):
+            return [_normalize_target_id_group(target_ids) for target_ids in target_ids_cfg]
+        return [_normalize_target_id_group(target_ids_cfg)]
+    return [[int(tracking_cfg["target_id"])]]
 
 
-def target_ids_label(target_ids: list[int]) -> str:
+def get_target_ids(tracking_cfg: dict[str, Any]) -> list[int]:
+    flattened: list[int] = []
+    for target_group in get_target_id_groups(tracking_cfg):
+        for target_id in target_group:
+            if target_id not in flattened:
+                flattened.append(target_id)
+    return flattened
+
+
+def _target_group_label(target_ids: list[int]) -> str:
+    return str(target_ids[0]) if len(target_ids) == 1 else "[" + ",".join(str(target_id) for target_id in target_ids) + "]"
+
+
+def target_ids_label(target_ids: list[int] | list[list[int]]) -> str:
+    if target_ids and isinstance(target_ids[0], (list, tuple)):
+        return " | ".join(_target_group_label([int(target_id) for target_id in target_group]) for target_group in target_ids)
     return ",".join(str(target_id) for target_id in target_ids)
 
 
@@ -160,16 +187,22 @@ def get_target_offsets(tracking_cfg: dict[str, Any], target_ids: list[int]) -> d
     return offsets
 
 
-def select_target(results: list[dict[str, Any]], target_ids: int | list[int], target_offsets: dict[int, np.ndarray] | None = None) -> dict[str, Any] | None:
+def _normalize_target_groups(target_ids: int | list[int] | list[list[int]]) -> list[list[int]]:
     if isinstance(target_ids, int):
-        target_id_list = [int(target_ids)]
-    else:
-        target_id_list = [int(target_id) for target_id in target_ids]
-    target_id_set = set(target_id_list)
-    matched = [result for result in results if int(result["id"]) in target_id_set]
-    if not matched:
-        return None
+        return [[int(target_ids)]]
+    if not target_ids:
+        return []
+    if isinstance(target_ids[0], (list, tuple)):
+        return [[int(target_id) for target_id in target_group] for target_group in target_ids]
+    return [[int(target_id) for target_id in target_ids]]
 
+
+def _build_target_result(
+    matched: list[dict[str, Any]],
+    target_id_list: list[int],
+    group_index: int,
+    target_offsets: dict[int, np.ndarray] | None,
+) -> dict[str, Any]:
     offsets = target_offsets or {}
     camera_centers = [np.asarray(result["center_in_camera_m"], dtype=np.float64) for result in matched]
     target_centers = [
@@ -193,6 +226,8 @@ def select_target(results: list[dict[str, Any]], target_ids: int | list[int], ta
 
     return {
         "id": target_id_list[0] if len(target_id_list) == 1 else target_id_list,
+        "target_ids": target_id_list,
+        "target_group_index": group_index,
         "visible_ids": [int(result["id"]) for result in matched],
         "corners": combined_corners,
         "center_in_camera_m": np.mean(np.stack(camera_centers, axis=0), axis=0),
@@ -201,13 +236,55 @@ def select_target(results: list[dict[str, Any]], target_ids: int | list[int], ta
     }
 
 
-def format_record(timestamp: float, target_ids: list[int], state: TrackState | None, visible: bool, visible_ids: list[int]) -> dict[str, Any]:
+def _target_selection_key(target: dict[str, Any]) -> tuple[float, float, float]:
+    target_ids = list(target.get("target_ids", []))
+    visible_ids = list(target.get("visible_ids", []))
+    corners = np.asarray(target["corners"], dtype=np.float64)
+    span = corners.max(axis=0) - corners.min(axis=0)
+    area_px = float(span[0] * span[1])
+    coverage = float(len(visible_ids)) / float(max(len(target_ids), 1))
+    return (float(len(visible_ids)), coverage, area_px)
+
+
+def select_target(results: list[dict[str, Any]], target_ids: int | list[int] | list[list[int]], target_offsets: dict[int, np.ndarray] | None = None) -> dict[str, Any] | None:
+    candidates = select_targets(results, target_ids, target_offsets)
+    if not candidates:
+        return None
+    return max(candidates, key=_target_selection_key)
+
+def select_targets(
+    results: list[dict[str, Any]],
+    target_ids: int | list[int] | list[list[int]],
+    target_offsets: dict[int, np.ndarray] | None = None,
+) -> list[dict[str, Any]]:
+    target_groups = _normalize_target_groups(target_ids)
+    candidates: list[dict[str, Any]] = []
+    for group_index, target_id_list in enumerate(target_groups):
+        target_id_set = set(target_id_list)
+        matched = [result for result in results if int(result["id"]) in target_id_set]
+        if not matched:
+            continue
+        candidates.append(_build_target_result(matched, target_id_list, group_index, target_offsets))
+    return candidates
+
+
+def format_record(
+    timestamp: float,
+    target_id_groups: list[list[int]],
+    selected_target_ids: list[int],
+    state: TrackState | None,
+    visible: bool,
+    visible_ids: list[int],
+) -> dict[str, Any]:
     iso_time = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat()
+    flat_target_ids = [target_id for target_group in target_id_groups for target_id in target_group]
     if state is None:
         return {
             "timestamp": timestamp,
             "datetime": iso_time,
-            "target_ids": target_ids,
+            "target_ids": flat_target_ids,
+            "target_id_groups": target_id_groups,
+            "selected_target_ids": selected_target_ids,
             "visible_ids": visible_ids,
             "visible": visible,
             "tracking_state": "lost",
@@ -219,7 +296,9 @@ def format_record(timestamp: float, target_ids: list[int], state: TrackState | N
     return {
         "timestamp": timestamp,
         "datetime": iso_time,
-        "target_ids": target_ids,
+        "target_ids": flat_target_ids,
+        "target_id_groups": target_id_groups,
+        "selected_target_ids": selected_target_ids,
         "visible_ids": visible_ids,
         "visible": visible,
         "tracking_state": state.source,
@@ -229,16 +308,34 @@ def format_record(timestamp: float, target_ids: list[int], state: TrackState | N
     }
 
 
-def draw_tracking_overlay(frame: np.ndarray, target_label: str, state: TrackState | None, visible_ids: list[int] | None = None) -> np.ndarray:
+def draw_tracking_overlay(
+    frame: np.ndarray,
+    target_label: str,
+    state: TrackState | None,
+    visible_ids: list[int] | None = None,
+    selected_target_ids: list[int] | None = None,
+) -> np.ndarray:
     output = frame.copy()
     visible_text = "none" if not visible_ids else ",".join(str(target_id) for target_id in visible_ids)
+    selected_text = "none" if not selected_target_ids else _target_group_label(selected_target_ids)
     if state is None:
-        cv2.putText(output, f"target_ids={target_label} visible_ids={visible_text} status=lost", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+        cv2.putText(
+            output,
+            f"targets={target_label} selected={selected_text} visible_ids={visible_text} status=lost",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (0, 0, 255),
+            2,
+        )
         return output
 
     color = (0, 255, 0) if state.source == "observed" else (0, 255, 255)
-    text = f"target_ids={target_label} visible_ids={visible_text} status={state.source} pos={np.round(state.position_target, 3).tolist()}"
-    cv2.putText(output, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    text = (
+        f"targets={target_label} selected={selected_text} visible_ids={visible_text} "
+        f"status={state.source} pos={np.round(state.position_target, 3).tolist()}"
+    )
+    cv2.putText(output, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
     if state.source == "predicted" and state.corners is not None:
         corners = np.round(state.corners).astype(np.int32).reshape(-1, 1, 2)
@@ -258,9 +355,9 @@ def main() -> None:
     tracking_cfg = config.get("tracking", {})
     logging_cfg = config.get("logging", {})
     display_cfg = config.get("display", {})
-    target_ids = get_target_ids(tracking_cfg)
-    target_offsets = get_target_offsets(tracking_cfg, target_ids)
-    target_label = target_ids_label(target_ids)
+    target_id_groups = get_target_id_groups(tracking_cfg)
+    target_offsets = get_target_offsets(tracking_cfg, get_target_ids(tracking_cfg))
+    target_label = target_ids_label(target_id_groups)
     tracker = TargetTracker(
         history_size=int(tracking_cfg.get("history_size", 10)),
         max_prediction_duration_s=float(tracking_cfg.get("max_prediction_duration_s", 1.0)),
@@ -289,8 +386,9 @@ def main() -> None:
         timestamp = first_timestamp
         while True:
             results = detect_markers(frame, context)
-            target = select_target(results, target_ids, target_offsets)
+            target = select_target(results, target_id_groups, target_offsets)
             visible_ids = [] if target is None else list(target.get("visible_ids", []))
+            selected_target_ids = [] if target is None else list(target.get("target_ids", []))
 
             if target is not None:
                 state = tracker.update(
@@ -304,12 +402,12 @@ def main() -> None:
                 state = None
                 visible = False
 
-            record = format_record(timestamp, target_ids, state, visible, visible_ids)
+            record = format_record(timestamp, target_id_groups, selected_target_ids, state, visible, visible_ids)
             logger.append(record)
             print(json.dumps(record, ensure_ascii=False))
 
             vis = draw_results(frame, results, context)
-            vis = draw_tracking_overlay(vis, target_label, state, visible_ids)
+            vis = draw_tracking_overlay(vis, target_label, state, visible_ids, selected_target_ids)
             video_logger.write(vis)
 
             if display_enabled:

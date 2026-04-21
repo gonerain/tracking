@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -185,6 +187,72 @@ class FrameSource:
         self.impl.release()
 
 
+class ArucoDebugWriter:
+    def __init__(self, config: dict[str, Any]) -> None:
+        debug_cfg = config.get("debug", {})
+        self.enabled = bool(debug_cfg.get("save_images", False))
+        self.save_jsonl = bool(debug_cfg.get("save_jsonl", False))
+        self.every_n_frames = max(int(debug_cfg.get("every_n_frames", 1)), 1)
+        self.output_dir = Path(str(debug_cfg.get("aruco_output_dir", "outputs/aruco_debug")))
+        self.images_dir = self.output_dir / "images"
+        self.jsonl_path = self.output_dir / "records.jsonl"
+        self.records: list[dict[str, Any]] = []
+        if self.enabled or self.save_jsonl:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.enabled:
+            self.images_dir.mkdir(parents=True, exist_ok=True)
+
+    def append(
+        self,
+        frame_index: int,
+        timestamp: float,
+        frame: np.ndarray,
+        vis: np.ndarray,
+        results: list[dict[str, Any]],
+        selected_target: dict[str, Any] | None,
+    ) -> None:
+        if frame_index % self.every_n_frames != 0:
+            return
+        suffix = f"frame_{frame_index:06d}_{timestamp:.3f}"
+        if self.enabled:
+            cv2.imwrite(str(self.images_dir / f"{suffix}.png"), vis)
+        if self.save_jsonl:
+            record = {
+                "frame_index": int(frame_index),
+                "timestamp": float(timestamp),
+                "datetime": datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat(),
+                "marker_count": len(results),
+                "markers": [
+                    {
+                        "id": int(result["id"]),
+                        "center_in_camera_m": np.round(np.asarray(result["center_in_camera_m"], dtype=np.float64), 6).tolist(),
+                        "center_in_target_m": np.round(np.asarray(result["center_in_target_m"], dtype=np.float64), 6).tolist(),
+                        "center_projected_px": np.round(np.asarray(result["center_projected_px"], dtype=np.float64), 3).tolist(),
+                        "corners_px": np.round(np.asarray(result["corners"], dtype=np.float64), 3).tolist(),
+                    }
+                    for result in results
+                ],
+                "selected_target": None
+                if selected_target is None
+                else {
+                    "target_ids": list(selected_target.get("target_ids", [])),
+                    "visible_ids": list(selected_target.get("visible_ids", [])),
+                    "center_in_target_m": np.round(np.asarray(selected_target["center_in_target_m"], dtype=np.float64), 6).tolist(),
+                    "center_projected_px": np.round(np.asarray(selected_target["center_projected_px"], dtype=np.float64), 3).tolist(),
+                    "corners_px": np.round(np.asarray(selected_target["corners"], dtype=np.float64), 3).tolist(),
+                },
+            }
+            self.records.append(record)
+
+    def flush(self) -> None:
+        if not self.save_jsonl:
+            return
+        payload = "\n".join(json.dumps(item, ensure_ascii=False) for item in self.records)
+        if payload:
+            payload += "\n"
+        self.jsonl_path.write_text(payload, encoding="utf-8")
+
+
 def load_config(config_path: str | Path) -> dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as file:
         return yaml.safe_load(file)
@@ -359,37 +427,102 @@ def main() -> None:
     config = load_config(args.config)
     context = build_detector_context(config)
     frame_source = FrameSource(config)
+    debug_writer = ArucoDebugWriter(config)
     display_cfg = config.get("display", {})
     display_enabled = bool(display_cfg.get("enabled", False))
     window_name = str(display_cfg.get("window_name", "aruco_detection"))
+    tracking_cfg = config.get("tracking", {})
+    target_id_groups: list[list[int]] = []
+    target_offsets: dict[int, np.ndarray] = {}
+    target_label = ""
+    if tracking_cfg:
+        from core.tracking import get_target_id_groups, get_target_ids, get_target_offsets, select_target, target_ids_label
+
+        target_id_groups = get_target_id_groups(tracking_cfg)
+        target_offsets = get_target_offsets(tracking_cfg, get_target_ids(tracking_cfg))
+        target_label = target_ids_label(target_id_groups)
 
     if display_enabled:
         print("Press q to quit.")
     else:
         print("Display disabled. Press Ctrl+C to quit.")
 
+    frame_index = 0
+    interrupted = False
+
     try:
         while True:
-            ok, frame, _ = frame_source.read()
-            if not ok or frame is None:
+            ok, frame, timestamp = frame_source.read()
+            if not ok or frame is None or timestamp is None:
                 break
 
             results = detect_markers(frame, context)
+            selected_target = None
+            if target_id_groups:
+                selected_target = select_target(results, target_id_groups, target_offsets)
             for result in results:
                 print(
                     f"marker_id={result['id']} center_in_camera_m={np.round(result['center_in_camera_m'], 4).tolist()} "
                     f"center_in_target_m={np.round(result['center_in_target_m'], 4).tolist()}"
                 )
+            if target_id_groups:
+                if selected_target is None:
+                    print(f"target_groups={target_label} selected_target=none")
+                else:
+                    selected_ids = list(selected_target.get("target_ids", []))
+                    selected_text = str(selected_ids[0]) if len(selected_ids) == 1 else "[" + ",".join(str(target_id) for target_id in selected_ids) + "]"
+                    print(
+                        f"target_groups={target_label} selected_target={selected_text} "
+                        f"visible_ids={selected_target.get('visible_ids', [])} "
+                        f"center_in_target_m={np.round(selected_target['center_in_target_m'], 4).tolist()}"
+                    )
+
+            vis = draw_results(frame, results, context)
+            if target_id_groups:
+                selected_text = "none"
+                visible_text = "none"
+                if selected_target is not None:
+                    selected_ids = list(selected_target.get("target_ids", []))
+                    selected_text = str(selected_ids[0]) if len(selected_ids) == 1 else "[" + ",".join(str(target_id) for target_id in selected_ids) + "]"
+                    visible_ids = list(selected_target.get("visible_ids", []))
+                    visible_text = ",".join(str(target_id) for target_id in visible_ids) if visible_ids else "none"
+                    corners = np.round(np.asarray(selected_target["corners"], dtype=np.float64)).astype(np.int32).reshape(-1, 1, 2)
+                    center = tuple(np.round(np.asarray(selected_target["center_projected_px"], dtype=np.float64)).astype(int).tolist())
+                    cv2.polylines(vis, [corners], isClosed=True, color=(0, 255, 255), thickness=2)
+                    cv2.circle(vis, center, 5, (0, 255, 255), -1)
+                cv2.putText(
+                    vis,
+                    f"targets={target_label} selected={selected_text} visible_ids={visible_text}",
+                    (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 255),
+                    2,
+                )
+
+            debug_writer.append(
+                frame_index=frame_index,
+                timestamp=float(timestamp),
+                frame=frame,
+                vis=vis,
+                results=results,
+                selected_target=selected_target,
+            )
 
             if display_enabled:
-                vis = draw_results(frame, results, context)
                 cv2.imshow(window_name, vis)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
+            frame_index += 1
+    except KeyboardInterrupt:
+        interrupted = True
     finally:
         frame_source.release()
+        debug_writer.flush()
         if display_enabled:
             cv2.destroyAllWindows()
+    if interrupted:
+        print("Interrupted by user.")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,13 @@
 input:
   rosbag:
-    bag_path: data/2026-04-14_mongkok-opensky-walk-006/rosbag/segment_2026-04-14-17-31-17_2.bag
+    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-16-58-16_2.bag
     topic: /lidar
     start_time_s: null
     end_time_s: null
     loop: false
+
+ie_pose:
+  path: data/2026-04-20_whampoa-suburban-walk-001/raw/novatel/GT.txt
 
 roi:
   shape: circle
@@ -57,14 +60,6 @@ clustering:
   merge_z_gap_m: 0.9
   merge_max_points: 8000
 
-temporal_fusion:
-  enabled: true
-  half_window_frames: 1
-  max_time_span_s: 0.25
-  motion_compensation_with_ie: true
-  voxel_size_m: 0.06
-  max_points_after_fusion: 20000
-
 ie_lidar_extrinsics:
   base_from_lidar:
     # T_base<-lidar (FLU), from GeoScanS2 TF drawing
@@ -83,22 +78,7 @@ ie_lidar_extrinsics:
 
 detector:
   enabled: true
-  # cluster | centerpoint | hybrid | aruco_mask_v2
   source: aruco_mask_v2
-  dedup_distance_m: 0.4
-  centerpoint:
-    # none | mmdet3d | python_module
-    provider: mmdet3d
-    score_threshold: 0.2
-    # Label ids considered person class by the detector.
-    person_label_ids: [0]
-    # mmdet3d backend
-    config_path: "checkpoints/centerpoint/centerpoint_nus.py"
-    checkpoint_path: "checkpoints/centerpoint/centerpoint_nus.pth"
-    device: cuda:0
-    # python_module backend: function(points_xyz: np.ndarray, timestamp: float) -> list[dict]
-    module_path: ""
-    function_name: infer
 
 person_cluster:
   min_points: 4
