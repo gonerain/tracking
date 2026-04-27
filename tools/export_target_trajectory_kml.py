@@ -64,6 +64,10 @@ def load_gt_points(path: Path) -> list[Point]:
             continue
         points.append((utc_s, lon, lat, alt, heading))
     points.sort(key=lambda p: p[0])
+    # Downsample GT to avoid overwhelming Google Earth with huge LineStrings
+    if len(points) > 10000:
+        step = max(1, len(points) // 10000)
+        points = points[::step]
     return points
 
 
@@ -163,6 +167,7 @@ def point_placemark(name: str, point: Point, altitude_mode: str, style_url: str 
 
 
 def sampled_points_folder(folder_name: str, prefix: str, points: list[Point], sample_step: int, altitude_mode: str) -> str:
+    """Return a KML Folder with sampled point placemarks. Disabled when sample_step <= 0."""
     if sample_step <= 0:
         return ""
     marks: list[str] = []
@@ -191,7 +196,6 @@ def write_kml(
         raise ValueError("No valid target tracks found.")
 
     target_parts: list[str] = []
-    target_sample_folders: list[str] = []
     for index, (name, points) in enumerate(sorted(target_tracks.items(), key=lambda item: item[0])):
         color = color_for_track(index)
         target_parts.append(
@@ -222,7 +226,7 @@ def write_kml(
     </Folder>
 """
         )
-        target_sample_folders.append(sampled_points_folder(f"{name}_sampled_points", name, points, sample_step, altitude_mode))
+        # sampled point placemarks disabled — GT and targets render as lines only
 
     kml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
@@ -236,7 +240,7 @@ def write_kml(
     <Style id="gtLine">
       <LineStyle>
         <color>ff0000ff</color>
-        <width>5</width>
+        <width>4</width>
       </LineStyle>
     </Style>
     <Style id="startPoint">
@@ -251,6 +255,10 @@ def write_kml(
         <scale>1.0</scale>
       </IconStyle>
     </Style>
+    <Folder>
+      <name>Targets</name>
+{''.join(target_parts)}
+    </Folder>
     <Folder>
       <name>GT_Full_Curve</name>
       <description><![CDATA[{desc_for_track(gt_points)}]]></description>
@@ -269,12 +277,6 @@ def write_kml(
 {point_placemark("gt_start", gt_points[0], altitude_mode, "#startPoint")}
 {point_placemark("gt_end", gt_points[-1], altitude_mode, "#endPoint")}
     </Folder>
-    <Folder>
-      <name>Targets</name>
-{''.join(target_parts)}
-    </Folder>
-{sampled_points_folder("GT_Sampled_Points", "gt", gt_points, sample_step, altitude_mode)}
-{''.join(target_sample_folders)}
   </Document>
 </kml>
 """

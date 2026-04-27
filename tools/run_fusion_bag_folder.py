@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-existing", action="store_true", help="Skip bags with existing target_world_positions.jsonl.")
     parser.add_argument("--continue-on-error", action="store_true", help="Continue processing later bags after a failure.")
+    parser.add_argument("--parallel", type=int, default=1, metavar="N", help="Number of bags to process in parallel (default: 1).")
     parser.add_argument("--export-kml", action="store_true", help="Export per-bag and merged KML after JSONL outputs are created.")
     parser.add_argument("--kml-sample-step", type=int, default=500, help="Sample step passed to KML exporter.")
     parser.add_argument(
@@ -221,7 +224,7 @@ def merge_fusion_json(inputs: list[tuple[str, Path]], output_path: Path) -> int:
     return len(records)
 
 
-def export_kml(input_jsonl: Path, output_kml: Path, gt_path: str | None, sample_step: int, log_path: Path) -> int:
+def export_kml_func(input_jsonl: Path, output_kml: Path, gt_path: str | None, sample_step: int, log_path: Path) -> int:
     command = [
         sys.executable,
         "tools/export_target_trajectory_kml.py",
@@ -237,12 +240,95 @@ def export_kml(input_jsonl: Path, output_kml: Path, gt_path: str | None, sample_
     return run_command(command, log_path)
 
 
+def process_single_bag(
+    bag_path: Path,
+    bag_out_dir: Path,
+    aruco_config: dict[str, Any],
+    lidar_config: dict[str, Any],
+    ie_path: str | None,
+    export_kml: bool,
+    kml_sample_step: int,
+    gt_path: str | None,
+    skip_existing: bool,
+) -> dict[str, Any]:
+    """Process a single bag file. Returns a manifest entry dict."""
+    bag_name = bag_path.stem
+    target_world_jsonl = bag_out_dir / "target_world_positions.jsonl"
+    fusion_json = bag_out_dir / "fusion_tracking_log.json"
+    status = "pending"
+    returncode = None
+
+    if skip_existing and target_world_jsonl.exists():
+        status = "skipped_existing"
+    else:
+        aruco_runtime_path, lidar_runtime_path = prepare_configs(bag_path, bag_out_dir, aruco_config, lidar_config)
+        command = [
+            sys.executable,
+            "core/fusion_tracking.py",
+            "--aruco-config",
+            str(aruco_runtime_path),
+            "--lidar-config",
+            str(lidar_runtime_path),
+            "--output-json",
+            str(fusion_json),
+            "--output-target-world-json",
+            str(target_world_jsonl),
+        ]
+        if ie_path:
+            command.extend(["--ie-path", str(ie_path)])
+
+        returncode = run_command(command, bag_out_dir / "run.log")
+        status = "completed" if returncode == 0 else "failed"
+
+    if export_kml and target_world_jsonl.exists():
+        export_kml_func(
+            target_world_jsonl,
+            bag_out_dir / "target_trajectory.kml",
+            gt_path,
+            kml_sample_step,
+            bag_out_dir / "kml_export.log",
+        )
+
+    return {
+        "bag": str(bag_path),
+        "bag_name": bag_path.name,
+        "status": status,
+        "returncode": returncode,
+        "output_dir": str(bag_out_dir),
+        "target_world_jsonl": str(target_world_jsonl),
+        "fusion_json": str(fusion_json),
+        "run_log": str(bag_out_dir / "run.log"),
+        "kml": str(bag_out_dir / "target_trajectory.kml") if export_kml else None,
+    }
+
+
 def main() -> None:
     args = parse_args()
     bag_dir = repo_path(args.bag_dir)
     output_dir = repo_path(args.output_dir)
     aruco_config_path = repo_path(args.aruco_config)
     lidar_config_path = repo_path(args.lidar_config)
+
+    # Write batch log to output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+    batch_log_path = output_dir / "batch_run.log"
+    file_handler = logging.FileHandler(str(batch_log_path), mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(message)s"))
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("batch")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    # Redirect print to logger
+    _orig_print = print
+    import builtins
+    def _log_print(*args_p, **kwargs_p):
+        msg = " ".join(str(a) for a in args_p)
+        logger.info(msg)
+    builtins.print = _log_print
 
     bags = sorted(bag_dir.glob(args.pattern), key=bag_sort_key)
     if not bags:
@@ -271,83 +357,82 @@ def main() -> None:
     manifest: list[dict[str, Any]] = []
     failures: list[tuple[str, int]] = []
 
-    for index, bag_path in enumerate(bags, start=1):
+    # Build job list
+    jobs: list[dict[str, Any]] = []
+    for bag_path in bags:
         bag_name = bag_path.stem
         bag_out_dir = output_dir / "bags" / bag_name
         target_world_jsonl = bag_out_dir / "target_world_positions.jsonl"
         fusion_json = bag_out_dir / "fusion_tracking_log.json"
         per_bag_jsonl.append((bag_path.name, target_world_jsonl))
         per_bag_fusion_json.append((bag_path.name, fusion_json))
-        status = "pending"
-        returncode = None
+        jobs.append({
+            "bag_path": bag_path,
+            "bag_out_dir": bag_out_dir,
+            "aruco_config": aruco_config,
+            "lidar_config": lidar_config,
+            "ie_path": args.ie_path,
+            "export_kml": args.export_kml,
+            "kml_sample_step": args.kml_sample_step,
+            "gt_path": gt_path,
+            "skip_existing": args.skip_existing,
+        })
 
-        print(f"[{index}/{len(bags)}] bag={bag_path}")
-        if args.skip_existing and target_world_jsonl.exists():
-            print(f"  skip existing: {target_world_jsonl}")
-            status = "skipped_existing"
-        else:
-            aruco_runtime_path, lidar_runtime_path = prepare_configs(bag_path, bag_out_dir, aruco_config, lidar_config)
-            command = [
-                sys.executable,
-                "core/fusion_tracking.py",
-                "--aruco-config",
-                str(aruco_runtime_path),
-                "--lidar-config",
-                str(lidar_runtime_path),
-                "--output-json",
-                str(fusion_json),
-                "--output-target-world-json",
-                str(target_world_jsonl),
-            ]
-            if args.ie_path:
-                command.extend(["--ie-path", str(args.ie_path)])
+    max_workers = max(int(args.parallel), 1)
 
-            returncode = run_command(command, bag_out_dir / "run.log")
-            if returncode != 0:
-                status = "failed"
-                failures.append((bag_path.name, returncode))
-                print(f"  failed returncode={returncode}; log={bag_out_dir / 'run.log'}")
+    if max_workers == 1:
+        # Sequential processing
+        for index, job in enumerate(jobs, start=1):
+            print(f"[{index}/{len(jobs)}] bag={job['bag_path']}")
+            result = process_single_bag(**job)
+            print(f"  status={result['status']}")
+            manifest.append(result)
+            if result["status"] == "failed":
+                failures.append((result["bag_name"], result["returncode"]))
                 if not args.continue_on_error:
-                    manifest.append(
-                        {
-                            "bag": str(bag_path),
-                            "status": status,
-                            "returncode": returncode,
-                            "output_dir": str(bag_out_dir),
-                            "target_world_jsonl": str(target_world_jsonl),
-                            "fusion_json": str(fusion_json),
-                            "run_log": str(bag_out_dir / "run.log"),
-                            "kml": str(bag_out_dir / "target_trajectory.kml") if args.export_kml else None,
-                        }
-                    )
                     break
-            else:
-                status = "completed"
-                print(f"  wrote {target_world_jsonl}")
+    else:
+        # Parallel processing
+        print(f"Processing {len(jobs)} bags with {max_workers} parallel workers...")
+        future_to_index: dict[Any, int] = {}
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            for index, job in enumerate(jobs):
+                future = executor.submit(process_single_bag, **job)
+                future_to_index[future] = index
 
-        if args.export_kml and target_world_jsonl.exists():
-            kml_code = export_kml(
-                target_world_jsonl,
-                bag_out_dir / "target_trajectory.kml",
-                gt_path,
-                args.kml_sample_step,
-                bag_out_dir / "kml_export.log",
-            )
-            if kml_code != 0:
-                print(f"  kml export failed returncode={kml_code}; log={bag_out_dir / 'kml_export.log'}")
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "bag": str(jobs[index]["bag_path"]),
+                        "bag_name": jobs[index]["bag_path"].name,
+                        "status": "failed",
+                        "returncode": -1,
+                        "output_dir": str(jobs[index]["bag_out_dir"]),
+                        "target_world_jsonl": str(jobs[index]["bag_out_dir"] / "target_world_positions.jsonl"),
+                        "fusion_json": str(jobs[index]["bag_out_dir"] / "fusion_tracking_log.json"),
+                        "run_log": str(jobs[index]["bag_out_dir"] / "run.log"),
+                        "kml": None,
+                    }
+                    print(f"  [{index+1}/{len(jobs)}] EXCEPTION bag={jobs[index]['bag_path'].name}: {exc}")
+                print(f"  [{index+1}/{len(jobs)}] {result['bag_name']}: {result['status']}")
+                if result["status"] == "failed":
+                    failures.append((result["bag_name"], result["returncode"]))
 
-        manifest.append(
-            {
-                "bag": str(bag_path),
-                "status": status,
-                "returncode": returncode,
-                "output_dir": str(bag_out_dir),
-                "target_world_jsonl": str(target_world_jsonl),
-                "fusion_json": str(fusion_json),
-                "run_log": str(bag_out_dir / "run.log"),
-                "kml": str(bag_out_dir / "target_trajectory.kml") if args.export_kml else None,
-            }
-        )
+        # Collect results in original order
+        results_by_bag: dict[str, dict[str, Any]] = {}
+        for future in future_to_index:
+            try:
+                r = future.result()
+                results_by_bag[r["bag"]] = r
+            except Exception:
+                pass
+        for job in jobs:
+            bag_key = str(job["bag_path"])
+            if bag_key in results_by_bag:
+                manifest.append(results_by_bag[bag_key])
 
     merged_dir = output_dir / "merged"
     merged_jsonl = merged_dir / "target_world_positions.jsonl"
@@ -359,7 +444,7 @@ def main() -> None:
         print(f"merged fusion json: {merged_dir / 'fusion_tracking_log.json'} records={merged_fusion_count}")
 
     if args.export_kml and merged_count > 0:
-        kml_code = export_kml(
+        kml_code = export_kml_func(
             merged_jsonl,
             merged_dir / "target_trajectory.kml",
             gt_path,

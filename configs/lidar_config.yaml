@@ -7,7 +7,7 @@ input:
     loop: false
 
 ie_pose:
-  path: data/0421-PM-2026/CollectionSystem/IE/0421-PM-2026.txt
+  path: /root/data/0421-AM-2026/CollectionSystem/IE/0421-AM-2026.txt
 
 roi:
   shape: circle
@@ -69,7 +69,7 @@ ie_lidar_extrinsics:
       - [-0.4226, 0.0, 0.9063]
     translation_m: [0.0315, 0.0, 0.1314]
   base_to_span:
-    # T_base<-span (FRD), from Extrinsics.pdf base_link_to_span_link
+    # T_span<-base (FLU->RFU), from Extrinsics.pdf base_link_to_span_link
     rotation_3x3:
       - [0.0, -1.0, 0.0]
       - [1.0, 0.0, 0.0]
@@ -136,12 +136,6 @@ logging:
 
 sync:
   camera_sync_max_dt_s: 0.08
-
-segmentation:
-  enabled: false
-  person_class_id: 0
-  min_person_mask_area_px: 5000
-  max_instances_considered: 5
 
 debug:
   save_images: false

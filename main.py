@@ -8,7 +8,6 @@ from core.detect_aruco import main as detect_aruco_main
 from core.fusion_tracking import main as fusion_tracking_main
 from core.ground_filter_lab import main as ground_filter_lab_main
 from core.lidar_tracking import main as lidar_tracking_main
-from core.segmentation import main as segment_image_main
 from core.tracking import main as tracking_main
 
 
@@ -17,7 +16,6 @@ ENTRYPOINTS: dict[str, EntryPoint] = {
     "detect_aruco": detect_aruco_main,
     "tracking": tracking_main,
     "lidar_tracking": lidar_tracking_main,
-    "segment_image": segment_image_main,
     "fusion_tracking": fusion_tracking_main,
     "ground_filter_lab": ground_filter_lab_main,
 }
@@ -35,11 +33,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     lidar_parser = subparsers.add_parser("lidar_tracking", help="Track a person-like cluster from lidar rosbag data.")
     lidar_parser.add_argument("--config", default="configs/lidar_config.yaml", help="Path to YAML config.")
-
-    segment_parser = subparsers.add_parser("segment_image", help="Run the configured segmentation model on a single image.")
-    segment_parser.add_argument("--config", default="configs/lidar_config.yaml", help="Path to YAML config.")
-    segment_parser.add_argument("--image", required=True, help="Input image path.")
-    segment_parser.add_argument("--output", default="outputs/segmentation_preview.png", help="Output preview image path.")
 
     fusion_parser = subparsers.add_parser("fusion_tracking", help="Fuse ArUco target prior with lidar person tracking.")
     fusion_parser.add_argument("--aruco-config", default="configs/aruco_config.yaml", help="Path to ArUco YAML config.")
@@ -135,17 +128,6 @@ def main() -> None:
             *([] if args.cluster_tolerance_m is None else ["--cluster-tolerance-m", str(args.cluster_tolerance_m)]),
             *([] if args.cluster_min_points is None else ["--cluster-min-points", str(args.cluster_min_points)]),
             *([] if args.cluster_max_points is None else ["--cluster-max-points", str(args.cluster_max_points)]),
-            *remaining,
-        ]
-    elif args.command == "segment_image":
-        sys.argv = [
-            f"{parser.prog} {args.command}",
-            "--config",
-            args.config,
-            "--image",
-            args.image,
-            "--output",
-            args.output,
             *remaining,
         ]
     else:
