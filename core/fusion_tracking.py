@@ -36,6 +36,7 @@ from core.lidar_tracking import (
 from core.segmentation import SegmentationPredictor, extract_person_masks, select_relevant_person_masks
 from core.tracking import (
     draw_tracking_overlay,
+    estimate_target_offsets_from_results,
     get_target_id_groups,
     get_target_ids,
     get_target_offsets,
@@ -61,6 +62,7 @@ class ArucoDebugState:
     tracking_state: Any
     target_result: dict[str, Any] | None
     target_results: list[dict[str, Any]]
+    calibrated_group_indices: list[int]
     segmentation: Any
     target_person_mask: np.ndarray | None
     selected_person_masks: list[np.ndarray]
@@ -611,7 +613,12 @@ class ArucoPriorProvider:
         tracking_cfg = config.get("tracking", {})
         self.target_id_groups = get_target_id_groups(tracking_cfg)
         self.target_ids = get_target_ids(tracking_cfg)
-        self.target_offsets = get_target_offsets(tracking_cfg, self.target_ids)
+        auto_offsets_cfg = dict(tracking_cfg.get("auto_target_offsets", {}))
+        self.auto_target_offsets_enabled = bool(auto_offsets_cfg.get("enabled", True))
+        self.auto_target_offsets_min_visible = int(auto_offsets_cfg.get("min_visible_markers", 3))
+        self.auto_target_offsets_by_group = bool(auto_offsets_cfg.get("once_per_group", True))
+        self.calibrated_group_indices: set[int] = set()
+        self.target_offsets = {} if self.auto_target_offsets_enabled else get_target_offsets(tracking_cfg, self.target_ids)
         self.target_label = target_ids_label(self.target_id_groups)
         self.latest_timestamp: float | None = None
         self.pending_frame: tuple[np.ndarray, float] | None = None
@@ -654,6 +661,22 @@ class ArucoPriorProvider:
             self.latest_frame = frame.copy()
             results = detect_markers(frame, self.context)
             self.latest_results = results
+            if self.auto_target_offsets_enabled:
+                candidate_groups = [
+                    target_group
+                    for group_index, target_group in enumerate(self.target_id_groups)
+                    if not self.auto_target_offsets_by_group or group_index not in self.calibrated_group_indices
+                ]
+                learned_offsets = estimate_target_offsets_from_results(
+                    results,
+                    candidate_groups,
+                    min_visible_markers=self.auto_target_offsets_min_visible,
+                )
+                if learned_offsets:
+                    self.target_offsets.update(learned_offsets)
+                    for group_index, target_group in enumerate(self.target_id_groups):
+                        if all(target_id in learned_offsets for target_id in target_group):
+                            self.calibrated_group_indices.add(group_index)
             target_results = select_targets(results, self.target_id_groups, self.target_offsets)
             target = None if not target_results else max(target_results, key=lambda item: (len(item.get("visible_ids", [])), len(item.get("target_ids", []))))
             self.latest_target_result = target
@@ -713,6 +736,7 @@ class ArucoPriorProvider:
             tracking_state=self.latest_tracking_state,
             target_result=self.latest_target_result,
             target_results=[dict(item) for item in self.latest_target_results],
+            calibrated_group_indices=sorted(int(index) for index in self.calibrated_group_indices),
             segmentation=None if self.latest_segmentation is None else self.latest_segmentation.copy(),
             target_person_mask=None if self.latest_target_person_mask is None else self.latest_target_person_mask.copy(),
             selected_person_masks=[mask.copy() for mask in self.latest_selected_person_masks],
@@ -956,6 +980,38 @@ class FusionDebugWriter:
             text_color,
             2,
         )
+
+        raw_ids = sorted(int(result["id"]) for result in aruco_debug.results if "id" in result)
+        cv2.putText(
+            panel,
+            f"aruco_raw_ids={raw_ids if raw_ids else 'none'}",
+            (20, 438),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            text_color,
+            2,
+        )
+        if aruco_debug.target_results:
+            y = 476
+            calibrated = set(int(index) for index in aruco_debug.calibrated_group_indices)
+            for target in sorted(aruco_debug.target_results, key=lambda item: int(item.get("target_group_index", -1))):
+                group_index = int(target.get("target_group_index", -1))
+                target_ids = list(target.get("target_ids", []))
+                visible_ids = list(target.get("visible_ids", []))
+                inferred_ids = list(target.get("inferred_ids", []))
+                center = np.round(np.asarray(target.get("center_in_target_m", [0.0, 0.0, 0.0]), dtype=np.float64), 3).tolist()
+                calib_text = "calib=yes" if group_index in calibrated else "calib=no"
+                apply_text = "offset=yes" if bool(target.get("offsets_applied", False)) else "offset=no"
+                line = (
+                    f"group_{group_index} ids={target_ids} visible={visible_ids} inferred={inferred_ids} "
+                    f"n={len(visible_ids)} {calib_text} {apply_text} center={center}"
+                )
+                cv2.putText(panel, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 255, 255), 2)
+                y += 34
+                if y > canvas_height - 28:
+                    break
+        else:
+            cv2.putText(panel, "aruco_groups=none", (20, 476), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 180, 255), 2)
 
         if aruco_debug.frame is None:
             cv2.putText(panel, "layout: front/info | raw bev | filtered bev", (20, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (80, 80, 80), 2)
@@ -1736,6 +1792,8 @@ def main() -> None:
                                 "target_group_index": int(target.get("target_group_index", -1)),
                                 "target_ids": list(target.get("target_ids", [])),
                                 "visible_ids": list(target.get("visible_ids", [])),
+                                "inferred_ids": list(target.get("inferred_ids", [])),
+                                "offsets_applied": bool(target.get("offsets_applied", False)),
                                 "target_lidar_m": np.round(aruco_lidar, 6).tolist(),
                                 "target_world_lla": [
                                     round(float(aruco_lat), 9),

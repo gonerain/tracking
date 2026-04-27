@@ -6,7 +6,7 @@ input:
     height: 1024
     fps: 10
   rosbag:
-    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-17-00-50_4.bag
+    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-16-59-35_3.bag
     topic: /front_camera/image/compressed
     start_time_s: 0.0
     end_time_s: null
@@ -33,7 +33,7 @@ video:
 
 aruco:
   dictionary: DICT_5X5_100
-  marker_length_m: 0.10
+  marker_length_m: 0.085
   detector:
     adaptiveThreshWinSizeMin: 3
     adaptiveThreshWinSizeMax: 23
@@ -54,13 +54,11 @@ tracking:
   target_id_groups:
     - [3, 17, 42, 88]
     - [2, 19, 55, 81]
-  # Per-marker offset from marker center to tracking reference point in lidar frame.
-  # The values below align ArUco prior to lidar footpoint semantics.
-  target_offsets_m:
-    "0": [1.2793, 0.0753, -0.2528]
-    "1": [1.2793, 0.0753, -0.2528]
-    "2": [1.2793, 0.0753, -0.2528]
-    "3": [1.2793, 0.0753, -0.2528]
+  auto_target_offsets:
+    enabled: true
+    min_visible_markers: 3
+    once_per_group: true
+  target_offsets_m: {}
   history_size: 10
   allow_prediction: false
   max_prediction_duration_s: 1.0

@@ -5,8 +5,9 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import Optional, Tuple
 
-Point = tuple[float, float, float, float, float | None]
+Point = Tuple[float, float, float, float, Optional[float]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -14,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", default="outputs/target_world_positions.jsonl", help="Input JSONL path.")
     parser.add_argument(
         "--gt-txt",
-        default="data/2026-04-20_whampoa-suburban-walk-001/raw/novatel/GT.txt",
+        default="data/0421-PM-2026/CollectionSystem/IE/0421-PM-2026.txt",
         help="NovAtel/Inertial Explorer GT.txt path. Use full GT curve for IE trajectory.",
     )
     parser.add_argument("--output", default="outputs/target_trajectory.kml", help="Output KML path.")
@@ -105,16 +106,6 @@ def load_target_tracks(path: Path) -> dict[str, list[Point]]:
                     continue
                 target_tracks.setdefault(f"target_{int(gid)}", []).append((t, lon, lat, alt, None))
             continue
-
-        lla = item.get("target_world_lla")
-        if isinstance(lla, list) and len(lla) >= 3:
-            try:
-                lat = float(lla[0])
-                lon = float(lla[1])
-                alt = float(lla[2])
-            except (TypeError, ValueError):
-                continue
-            target_tracks.setdefault("target_0", []).append((t, lon, lat, alt, None))
 
     cleaned: dict[str, list[Point]] = {}
     for name, points in target_tracks.items():

@@ -1,13 +1,13 @@
 input:
   rosbag:
-    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-17-00-50_4.bag
+    bag_path: data/2026-04-20_whampoa-suburban-walk-001/rosbag/segment_2026-04-20-16-59-35_3.bag
     topic: /lidar
     start_time_s: null
     end_time_s: null
     loop: false
 
 ie_pose:
-  path: data/2026-04-20_whampoa-suburban-walk-001/raw/novatel/GT.txt
+  path: data/0421-PM-2026/CollectionSystem/IE/0421-PM-2026.txt
 
 roi:
   shape: circle
@@ -71,10 +71,10 @@ ie_lidar_extrinsics:
   base_to_span:
     # T_base<-span (FRD), from Extrinsics.pdf base_link_to_span_link
     rotation_3x3:
-      - [1.0, 0.0, 0.0]
       - [0.0, -1.0, 0.0]
-      - [0.0, 0.0, -1.0]
-    translation_m: [-0.2684, -0.082, -0.1527]
+      - [1.0, 0.0, 0.0]
+      - [0.0, 0.0, 1.0]
+    translation_m: [0.0, 0.1854, 0.242]
 
 person_cluster:
   min_points: 4
@@ -130,8 +130,8 @@ tracker:
 logging:
   output_json: outputs/lidar_tracking_log.json
   print_summary_every_frame: true
-  flush_every_frame: true
-  write_fusion_json: false
+  flush_every_frame: false
+  write_fusion_json: true
   write_target_world_json: true
 
 sync:
@@ -144,7 +144,7 @@ segmentation:
   max_instances_considered: 5
 
 debug:
-  save_images: true
+  save_images: false
   output_dir: outputs/lidar_debug
   every_n_frames: 5
   image_width: 1200

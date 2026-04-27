@@ -4,7 +4,6 @@ import argparse
 import json
 import math
 import sys
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +12,11 @@ from typing import Any
 import cv2
 import numpy as np
 import yaml
+
+try:
+    from scipy.spatial import cKDTree
+except Exception:  # pragma: no cover - optional runtime acceleration
+    cKDTree = None
 
 from core.geometry import project_camera_point_to_image
 from core.segmentation import INSTANCE_PALETTE, SegmentationPredictor, extract_person_mask, extract_person_masks, select_relevant_person_masks, visualize_instance, visualize_panoptic, visualize_semantic
@@ -669,12 +673,61 @@ def pairwise_distances(points: np.ndarray) -> np.ndarray:
     return np.sqrt(np.sum(deltas * deltas, axis=2))
 
 
-def euclidean_clusters(points: np.ndarray, tolerance: float, min_points: int, max_points: int) -> list[np.ndarray]:
-    if points.size == 0:
-        return []
-    if tolerance <= 0.0:
-        raise ValueError(f"tolerance must be positive, got {tolerance}")
+def _cluster_points_ckdtree(
+    points: np.ndarray,
+    tolerance: float,
+    min_points: int,
+    max_points: int,
+) -> list[np.ndarray]:
+    num_points = int(points.shape[0])
+    tree = cKDTree(points[:, :3])
+    pair_indices = tree.query_pairs(float(tolerance), output_type="ndarray")
 
+    parents = np.arange(num_points, dtype=np.int32)
+    ranks = np.zeros(num_points, dtype=np.uint8)
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = int(parents[index])
+        return index
+
+    def union(a: int, b: int) -> None:
+        root_a = find(a)
+        root_b = find(b)
+        if root_a == root_b:
+            return
+        if ranks[root_a] < ranks[root_b]:
+            parents[root_a] = root_b
+            return
+        if ranks[root_a] > ranks[root_b]:
+            parents[root_b] = root_a
+            return
+        parents[root_b] = root_a
+        ranks[root_a] += 1
+
+    for a, b in pair_indices:
+        union(int(a), int(b))
+
+    root_to_indices: dict[int, list[int]] = {}
+    for index in range(num_points):
+        root = find(index)
+        root_to_indices.setdefault(root, []).append(index)
+
+    ordered_clusters = sorted(root_to_indices.values(), key=lambda indices: indices[0])
+    clusters: list[np.ndarray] = []
+    for member_indices in ordered_clusters:
+        if min_points <= len(member_indices) <= max_points:
+            clusters.append(points[np.asarray(member_indices, dtype=np.int32)])
+    return clusters
+
+
+def _cluster_points_spatial_hash(
+    points: np.ndarray,
+    tolerance: float,
+    min_points: int,
+    max_points: int,
+) -> list[np.ndarray]:
     num_points = int(points.shape[0])
     visited = np.zeros(num_points, dtype=bool)
     tolerance_sq = float(tolerance * tolerance)
@@ -692,12 +745,14 @@ def euclidean_clusters(points: np.ndarray, tolerance: float, min_points: int, ma
         if visited[start_index]:
             continue
 
-        queue = deque([start_index])
+        queue = [start_index]
         visited[start_index] = True
         member_indices: list[int] = []
+        queue_index = 0
 
-        while queue:
-            current = queue.popleft()
+        while queue_index < len(queue):
+            current = queue[queue_index]
+            queue_index += 1
             member_indices.append(current)
 
             cx, cy, cz = (int(grid[current, 0]), int(grid[current, 1]), int(grid[current, 2]))
@@ -722,6 +777,16 @@ def euclidean_clusters(points: np.ndarray, tolerance: float, min_points: int, ma
             clusters.append(points[np.asarray(member_indices, dtype=np.int32)])
 
     return clusters
+
+
+def euclidean_clusters(points: np.ndarray, tolerance: float, min_points: int, max_points: int) -> list[np.ndarray]:
+    if points.size == 0:
+        return []
+    if tolerance <= 0.0:
+        raise ValueError(f"tolerance must be positive, got {tolerance}")
+    if cKDTree is not None and int(points.shape[0]) > 1:
+        return _cluster_points_ckdtree(points, tolerance, min_points, max_points)
+    return _cluster_points_spatial_hash(points, tolerance, min_points, max_points)
 
 
 def merge_vertical_person_clusters(
