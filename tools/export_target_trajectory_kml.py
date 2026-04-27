@@ -196,6 +196,11 @@ def write_kml(
         t_max = max(all_target_ts) + 5.0
         gt_points = [p for p in gt_points if t_min <= p[0] <= t_max]
 
+    # Downsample if still too large for Google Earth to render
+    if len(gt_points) > 10000:
+        step = max(1, len(gt_points) // 10000)
+        gt_points = gt_points[::step]
+
     if len(gt_points) < 2:
         raise ValueError(f"Not enough GT points: {len(gt_points)}")
 
