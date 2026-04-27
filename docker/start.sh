@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
 
-CONTAINER_NAME="${CONTAINER_NAME:-rospytorch}"
-IMAGE_NAME="${IMAGE_NAME:-ebhrz/ros-pytorch:noetic_pt110_cu113}"
+CONTAINER_NAME="${CONTAINER_NAME:-tracking}"
+IMAGE_NAME="${IMAGE_NAME:-tracking:noetic}"
 MOUNT_TARGET="${MOUNT_TARGET:-/root/HDMap}"
 
 run_shell='source /opt/ros/noetic/setup.bash && exec /bin/bash'
@@ -30,7 +30,6 @@ fi
 ensure_x11_access
 
 docker_args=(
-  --gpus all
   -it
   --name "${CONTAINER_NAME}"
   -v "${WORKSPACE_ROOT}:${MOUNT_TARGET}"

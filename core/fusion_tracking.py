@@ -29,11 +29,9 @@ from core.lidar_tracking import (
     remove_ego_vehicle_points,
     remove_ground,
     render_debug_image,
-    render_segmentation_preview,
     render_target_crop_image,
     stack_debug_images,
 )
-from core.segmentation import SegmentationPredictor, extract_person_masks, select_relevant_person_masks
 from core.tracking import (
     draw_tracking_overlay,
     estimate_target_offsets_from_results,
@@ -63,10 +61,6 @@ class ArucoDebugState:
     target_result: dict[str, Any] | None
     target_results: list[dict[str, Any]]
     calibrated_group_indices: list[int]
-    segmentation: Any
-    target_person_mask: np.ndarray | None
-    selected_person_masks: list[np.ndarray]
-    raw_person_mask_count: int
 
 
 @dataclass
@@ -557,10 +551,10 @@ def configure_span_lidar_extrinsics(lidar_config: dict[str, Any]) -> None:
     r_base_from_lidar = _as_3x3_matrix(base_from_lidar.get("rotation_3x3", R_BASE_FROM_LIDAR), R_BASE_FROM_LIDAR)
     t_base_from_lidar = _as_3_vector(base_from_lidar.get("translation_m", T_BASE_FROM_LIDAR_M), T_BASE_FROM_LIDAR_M)
     if base_to_span:
-        r_base_from_span = _as_3x3_matrix(base_to_span.get("rotation_3x3", R_BASE_FROM_SPAN), R_BASE_FROM_SPAN)
-        t_base_from_span = _as_3_vector(base_to_span.get("translation_m", T_BASE_FROM_SPAN_M), T_BASE_FROM_SPAN_M)
-        r_span_from_base = r_base_from_span.T
-        t_span_from_base = -r_span_from_base @ t_base_from_span
+        # Config key "base_to_span" stores the full T_span←base transform:
+        # R_span_from_base (FLU→RFU) and t_span_from_base, both used directly.
+        r_span_from_base = _as_3x3_matrix(base_to_span.get("rotation_3x3", R_SPAN_FROM_BASE), R_SPAN_FROM_BASE)
+        t_span_from_base = _as_3_vector(base_to_span.get("translation_m", T_SPAN_FROM_BASE_M), T_SPAN_FROM_BASE_M)
     else:
         # Backward compatibility: interpret legacy key directly as T_span<-base.
         r_span_from_base = _as_3x3_matrix(span_from_base_legacy.get("rotation_3x3", R_SPAN_FROM_BASE), R_SPAN_FROM_BASE)
@@ -582,18 +576,19 @@ def configure_span_lidar_extrinsics(lidar_config: dict[str, Any]) -> None:
 def lidar_to_ie_body(point_lidar: np.ndarray) -> np.ndarray:
     # Output: point in vehicle FLU axes, translated so the origin coincides
     # with the SPAN body origin. The intermediate `R_SPAN_FROM_LIDAR @ p + t`
-    # produces span FRD coords; the subsequent [x, -y, -z] converts FRD back
-    # to vehicle FLU while preserving the span-origin offset.
+    # produces span RFU coords; the subsequent [y, -x, z] converts RFU to
+    # vehicle FLU while preserving the span-origin offset.
     p_l = np.asarray(point_lidar, dtype=np.float64).reshape(3)
-    p_span_frd = R_SPAN_FROM_LIDAR_ACTIVE @ p_l + T_SPAN_FROM_LIDAR_M_ACTIVE
-    return np.array([p_span_frd[0], -p_span_frd[1], -p_span_frd[2]], dtype=np.float64)
+    p_span_rfu = R_SPAN_FROM_LIDAR_ACTIVE @ p_l + T_SPAN_FROM_LIDAR_M_ACTIVE
+    return np.array([p_span_rfu[1], -p_span_rfu[0], p_span_rfu[2]], dtype=np.float64)
 
 
 def ie_body_to_lidar(point_body: np.ndarray) -> np.ndarray:
     # Inverse of lidar_to_ie_body. Input is vehicle FLU centered at SPAN origin.
+    # FLU -> RFU: rfu_x(R) = -flu_y(L), rfu_y(F) = flu_x(F), rfu_z(U) = flu_z(U)
     p_body_flu = np.asarray(point_body, dtype=np.float64).reshape(3)
-    p_span_frd = np.array([p_body_flu[0], -p_body_flu[1], -p_body_flu[2]], dtype=np.float64)
-    return R_LIDAR_FROM_SPAN_ACTIVE @ p_span_frd + T_LIDAR_FROM_SPAN_M_ACTIVE
+    p_span_rfu = np.array([-p_body_flu[1], p_body_flu[0], p_body_flu[2]], dtype=np.float64)
+    return R_LIDAR_FROM_SPAN_ACTIVE @ p_span_rfu + T_LIDAR_FROM_SPAN_M_ACTIVE
 
 
 def ie_pose_to_enu(
@@ -627,12 +622,6 @@ class ArucoPriorProvider:
         self.latest_tracking_state: Any = None
         self.latest_target_result: dict[str, Any] | None = None
         self.latest_target_results: list[dict[str, Any]] = []
-        self.segmentation_predictor = SegmentationPredictor(config)
-        self.segmentation_cfg = config.get("segmentation", {})
-        self.latest_segmentation: Any = None
-        self.latest_target_person_mask: np.ndarray | None = None
-        self.latest_selected_person_masks: list[np.ndarray] = []
-        self.latest_raw_person_mask_count = 0
         sync_cfg = config.get("sync", {})
         self.sync_max_dt_s = float(sync_cfg.get("camera_sync_max_dt_s", 0.08))
         self.latest_sync_dt_ms: float | None = None
@@ -681,19 +670,6 @@ class ArucoPriorProvider:
             target = None if not target_results else max(target_results, key=lambda item: (len(item.get("visible_ids", [])), len(item.get("target_ids", []))))
             self.latest_target_result = target
             self.latest_target_results = target_results
-            self.latest_segmentation = self.segmentation_predictor.predict(frame)
-            (
-                self.latest_target_person_mask,
-                self.latest_selected_person_masks,
-                self.latest_raw_person_mask_count,
-            ) = select_target_person_mask(
-                frame=frame,
-                segmentation=self.latest_segmentation,
-                target_results=target_results,
-                person_class_id=self.segmentation_predictor.person_class_id,
-                min_area_px=int(self.segmentation_cfg.get("min_person_mask_area_px", 3000)),
-                max_instances=int(self.segmentation_cfg.get("max_instances_considered", 3)),
-            )
             self.latest_tracking_state = None
 
     def get_prior(self, timestamp: float) -> ArucoPrior | None:
@@ -737,68 +713,7 @@ class ArucoPriorProvider:
             target_result=self.latest_target_result,
             target_results=[dict(item) for item in self.latest_target_results],
             calibrated_group_indices=sorted(int(index) for index in self.calibrated_group_indices),
-            segmentation=None if self.latest_segmentation is None else self.latest_segmentation.copy(),
-            target_person_mask=None if self.latest_target_person_mask is None else self.latest_target_person_mask.copy(),
-            selected_person_masks=[mask.copy() for mask in self.latest_selected_person_masks],
-            raw_person_mask_count=int(self.latest_raw_person_mask_count),
         )
-
-
-def select_target_person_mask(
-    frame: np.ndarray,
-    segmentation: Any,
-    target_results: list[dict[str, Any]],
-    person_class_id: int = 19,
-    min_area_px: int = 0,
-    max_instances: int | None = None,
-) -> tuple[np.ndarray | None, list[np.ndarray], int]:
-    if segmentation is None or not target_results:
-        return None, [], 0
-
-    split_mode = "none" if isinstance(segmentation, dict) else "auto"
-    person_masks = extract_person_masks(segmentation, person_class_id, split_mode=split_mode)
-    raw_person_mask_count = len(person_masks)
-    person_masks = select_relevant_person_masks(
-        person_masks,
-        image_shape=frame.shape,
-        min_area_px=min_area_px,
-        max_instances=max_instances,
-    )
-    if not person_masks:
-        return None, [], raw_person_mask_count
-
-    h, w = frame.shape[:2]
-    target_centers: list[tuple[int, int]] = []
-    for target_result in target_results:
-        center = np.round(target_result["center_projected_px"]).astype(int)
-        cx = int(np.clip(center[0], 0, w - 1))
-        cy = int(np.clip(center[1], 0, h - 1))
-        target_centers.append((cx, cy))
-
-    selected_masks: list[np.ndarray] = []
-    for cx, cy in target_centers:
-        best_mask = None
-        best_distance = None
-        for mask in person_masks:
-            mask = np.asarray(mask, dtype=bool)
-            if mask[cy, cx]:
-                best_mask = mask
-                break
-            ys, xs = np.where(mask)
-            if xs.size == 0:
-                continue
-            distances = (xs - cx) ** 2 + (ys - cy) ** 2
-            nearest_distance = float(np.min(distances))
-            if best_mask is None or nearest_distance < best_distance:
-                best_mask = mask
-                best_distance = nearest_distance
-        if best_mask is not None:
-            selected_masks.append(best_mask)
-
-    if not selected_masks:
-        return None, person_masks, raw_person_mask_count
-    merged_mask = np.any(np.stack(selected_masks, axis=0), axis=0)
-    return merged_mask, person_masks, raw_person_mask_count
 
 
 def overlay_target_mask(frame: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
@@ -824,7 +739,6 @@ class FusionDebugWriter:
         if self.enabled:
             for subdir in [
                 "front_camera",
-                "segmentation",
                 "raw_bev",
                 "filtered_bev",
                 "side_view",
@@ -869,8 +783,7 @@ class FusionDebugWriter:
             cv2.putText(canvas, f"lidar_ts={lidar_timestamp:.3f}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 40), 2)
             return canvas
 
-        vis = overlay_target_mask(aruco_debug.frame, aruco_debug.target_person_mask)
-        vis = draw_results(vis, aruco_debug.results, aruco_context)
+        vis = draw_results(aruco_debug.frame.copy(), aruco_debug.results, aruco_context)
         visible_ids = [] if aruco_debug.target_result is None else list(aruco_debug.target_result.get("visible_ids", []))
         selected_target_ids = [] if aruco_debug.target_result is None else list(aruco_debug.target_result.get("target_ids", []))
         vis = draw_tracking_overlay(vis, self.target_label, aruco_debug.tracking_state, visible_ids, selected_target_ids)
@@ -894,18 +807,6 @@ class FusionDebugWriter:
         if aruco_selected_candidate is not None:
             match_text = f"aruco_match={np.round(aruco_selected_candidate.footpoint, 3).tolist()}"
         cv2.putText(vis, match_text, (20, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        if aruco_debug.target_person_mask is not None:
-            mask_pixels = int(np.count_nonzero(aruco_debug.target_person_mask))
-            cv2.putText(vis, f"target_mask_pixels={mask_pixels}", (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(
-            vis,
-            f"raw_masks={aruco_debug.raw_person_mask_count} selected_masks={len(aruco_debug.selected_person_masks)}",
-            (20, 158),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2,
-        )
         return vis
 
     def _render_overview_info_panel(
@@ -973,7 +874,7 @@ class FusionDebugWriter:
         cv2.putText(panel, f"roi x={x_limits} y={y_limits} z={z_limits}", (20, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.62, text_color, 2)
         cv2.putText(
             panel,
-            f"raw_masks={aruco_debug.raw_person_mask_count} selected_masks={len(aruco_debug.selected_person_masks)}",
+            "",
             (20, 398),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.62,
@@ -1015,7 +916,7 @@ class FusionDebugWriter:
 
         if aruco_debug.frame is None:
             cv2.putText(panel, "layout: front/info | raw bev | filtered bev", (20, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (80, 80, 80), 2)
-            cv2.putText(panel, "        side view | target crop | segmentation", (20, 506), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (80, 80, 80), 2)
+            cv2.putText(panel, "        side view | target crop", (20, 506), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (80, 80, 80), 2)
             cv2.putText(panel, "gray=points  orange=boxes  blue=centroid", (20, 578), cv2.FONT_HERSHEY_SIMPLEX, 0.64, (90, 90, 90), 2)
             cv2.putText(panel, "red=footpoint  green/yellow=track", (20, 614), cv2.FONT_HERSHEY_SIMPLEX, 0.64, (90, 90, 90), 2)
         return panel
@@ -1033,7 +934,6 @@ class FusionDebugWriter:
         aruco_selected_candidate: ClusterCandidate | None,
         aruco_debug: ArucoDebugState,
         aruco_context: Any,
-        person_class_id: int,
     ) -> None:
         if not self.enabled or frame_index % self.every_n_frames != 0:
             return
@@ -1085,19 +985,6 @@ class FusionDebugWriter:
             aruco_debug=aruco_debug,
             aruco_context=aruco_context,
         )
-        segmentation_preview = render_segmentation_preview(
-            frame=aruco_debug.frame,
-            segmentation=aruco_debug.segmentation,
-            person_mask=aruco_debug.target_person_mask,
-            selected_person_masks=aruco_debug.selected_person_masks,
-            raw_person_mask_count=aruco_debug.raw_person_mask_count,
-            frame_index=frame_index,
-            timestamp=timestamp,
-            camera_timestamp=aruco_debug.frame_timestamp,
-            sync_dt_ms=aruco_debug.sync_dt_ms,
-            person_class_id=person_class_id,
-            config=config,
-        )
         overview = stack_debug_images(
             [
                 self._render_overview_info_panel(
@@ -1116,13 +1003,11 @@ class FusionDebugWriter:
                 filtered_bev,
                 side_view,
                 target_crop,
-                segmentation_preview,
             ],
             config,
         )
 
         cv2.imwrite(str(self.output_dir / "front_camera" / f"{suffix}.png"), front_camera)
-        cv2.imwrite(str(self.output_dir / "segmentation" / f"{suffix}.png"), segmentation_preview)
         cv2.imwrite(str(self.output_dir / "raw_bev" / f"{suffix}.png"), raw_bev)
         cv2.imwrite(str(self.output_dir / "filtered_bev" / f"{suffix}.png"), filtered_bev)
         cv2.imwrite(str(self.output_dir / "side_view" / f"{suffix}.png"), side_view)
@@ -1364,41 +1249,149 @@ def lidar_point_to_camera(point_lidar: np.ndarray, aruco_context: Any) -> np.nda
     return rotation_target_from_camera.T @ (np.asarray(point_lidar, dtype=np.float64) - translation_target_from_camera)
 
 
-def select_points_in_target_mask(
+def _project_lidar_points_to_image(
     points: np.ndarray,
-    aruco_debug: ArucoDebugState,
     aruco_context: Any,
-) -> tuple[np.ndarray, int]:
-    if points.size == 0 or aruco_debug.target_person_mask is None:
-        return np.empty((0, 3), dtype=np.float64), 0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project LiDAR points to camera image plane (vectorized).
 
-    mask = aruco_debug.target_person_mask
-    h, w = mask.shape[:2]
-    selected: list[np.ndarray] = []
-    projected_count = 0
-    for point in points:
-        point_camera = lidar_point_to_camera(point, aruco_context)
-        if point_camera[2] <= 0:
-            continue
-        try:
-            pixel = project_camera_point_to_image(
-                point_camera,
-                aruco_context.camera_matrix,
-                aruco_context.dist_coeffs,
-                camera_model=aruco_context.camera_model,
-            )
-        except ValueError:
-            continue
-        x, y = np.round(pixel).astype(int)
-        if x < 0 or x >= w or y < 0 or y >= h:
-            continue
-        projected_count += 1
-        if mask[y, x]:
-            selected.append(point)
+    Returns (pixels_xy, front_mask, valid_mask):
+      - pixels_xy: (N, 2) projected pixel coordinates
+      - front_mask: (N,) bool mask for points in front of camera
+      - valid_mask: (N,) bool mask for points with valid projection
+    """
+    R = np.asarray(aruco_context.rotation_target_from_camera, dtype=np.float64)
+    t = np.asarray(aruco_context.translation_target_from_camera, dtype=np.float64)
+    points_camera = (R.T @ (points[:, :3] - t).T).T  # (N, 3)
 
-    if not selected:
-        return np.empty((0, 3), dtype=np.float64), projected_count
-    return np.asarray(selected, dtype=np.float64), projected_count
+    front_mask = points_camera[:, 2] > 0
+    pixels_xy = np.full((points.shape[0], 2), np.nan, dtype=np.float64)
+
+    if not np.any(front_mask):
+        return pixels_xy, front_mask, np.zeros(points.shape[0], dtype=bool)
+
+    front_points = points_camera[front_mask].reshape(-1, 1, 3)
+    camera_matrix = np.asarray(aruco_context.camera_matrix, dtype=np.float64)
+    dist_coeffs = np.asarray(aruco_context.dist_coeffs, dtype=np.float64).reshape(-1, 1)
+    camera_model = str(getattr(aruco_context, "camera_model", "pinhole")).lower()
+
+    rvec = np.zeros((3, 1), dtype=np.float64)
+    tvec = np.zeros((3, 1), dtype=np.float64)
+
+    if camera_model == "equidistant":
+        img_pts, _ = cv2.fisheye.projectPoints(
+            objectPoints=front_points, rvec=rvec, tvec=tvec, K=camera_matrix, D=dist_coeffs,
+        )
+    else:
+        img_pts, _ = cv2.projectPoints(
+            objectPoints=front_points, rvec=rvec, tvec=tvec,
+            cameraMatrix=camera_matrix, distCoeffs=dist_coeffs,
+        )
+
+    pixels_xy[front_mask] = img_pts.reshape(-1, 2)
+    valid_mask = front_mask & ~np.isnan(pixels_xy[:, 0])
+    return pixels_xy, front_mask, valid_mask
+
+
+def select_points_in_aruco_roi(
+    points: np.ndarray,
+    aruco_target_results: list[dict[str, Any]],
+    aruco_context: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Filter LiDAR points by projecting into the ArUco marker image region.
+
+    Args:
+        points: (N, 3) LiDAR point cloud.
+        aruco_target_results: list of ArUco detection dicts, each with 'corners' (4×2 px).
+        aruco_context: CameraProjectionContext with camera intrinsics and extrinsics.
+
+    Returns:
+        (filtered_points, aruco_depth_m):
+          - filtered_points: points whose projection falls inside the ArUco bbox.
+          - aruco_depth_m: estimated depth of ArUco center in camera frame.
+    """
+    if points.size == 0 or not aruco_target_results:
+        return np.empty((0, 3), dtype=np.float64), np.nan
+
+    # Compute tight bounding box from all visible marker corners
+    all_corners = np.concatenate(
+        [np.asarray(r["corners"], dtype=np.float64).reshape(-1, 2) for r in aruco_target_results],
+        axis=0,
+    )
+    bbox_min = all_corners.min(axis=0)  # (x_min, y_min)
+    bbox_max = all_corners.max(axis=0)  # (x_max, y_max)
+
+    # ArUco depth: mean z of marker centers in camera frame
+    R = np.asarray(aruco_context.rotation_target_from_camera, dtype=np.float64)
+    t = np.asarray(aruco_context.translation_target_from_camera, dtype=np.float64)
+    aruco_depths = []
+    for r in aruco_target_results:
+        center_lidar = np.asarray(r["center_in_target_m"], dtype=np.float64)
+        center_camera = R.T @ (center_lidar - t)
+        aruco_depths.append(float(center_camera[2]))
+    aruco_depth_m = float(np.mean(aruco_depths))
+
+    # Vectorized projection
+    pixels_xy, _, valid_mask = _project_lidar_points_to_image(points, aruco_context)
+
+    # Filter by bounding box
+    in_bbox = (
+        valid_mask
+        & (pixels_xy[:, 0] >= bbox_min[0])
+        & (pixels_xy[:, 0] <= bbox_max[0])
+        & (pixels_xy[:, 1] >= bbox_min[1])
+        & (pixels_xy[:, 1] <= bbox_max[1])
+    )
+
+    return points[in_bbox], aruco_depth_m
+
+
+def cluster_aruco_roi_points(
+    points: np.ndarray,
+    aruco_depth_m: float,
+    tolerance_m: float = 0.45,
+    min_cluster_points: int = 3,
+    max_cluster_points: int = 5000,
+) -> np.ndarray:
+    """Cluster points from ArUco ROI and return centroid of best cluster.
+
+    Runs euclidean clustering, then selects the largest cluster whose centroid
+    is closest to the ArUco depth.
+
+    Returns:
+        centroid (3,) of the selected cluster, or empty array if no valid cluster.
+    """
+    if points.size == 0:
+        return np.empty((0,), dtype=np.float64)
+
+    clusters = euclidean_clusters(
+        points=points,
+        tolerance=tolerance_m,
+        min_points=min_cluster_points,
+        max_points=max_cluster_points,
+    )
+
+    if not clusters:
+        return np.empty((0,), dtype=np.float64)
+
+    # Score clusters: prefer largest cluster closest to ArUco depth
+    best_cluster = None
+    best_score = -math.inf
+    for cluster in clusters:
+        centroid = np.mean(cluster, axis=0)
+        # Distance from cluster centroid to ArUco center in LiDAR frame
+        point_count = cluster.shape[0]
+        # Larger clusters score higher, penalize distance to ArUco depth
+        # (depth comparison not directly available in LiDAR frame, use 3D distance)
+        score = point_count
+        if best_cluster is None or score > best_score:
+            best_score = score
+            best_cluster = cluster
+
+    if best_cluster is None:
+        return np.empty((0,), dtype=np.float64)
+
+    return np.mean(best_cluster, axis=0)
 
 
 def apply_aruco_local_roi(
@@ -1463,13 +1456,10 @@ def format_fusion_record(
     candidates: list[ClusterCandidate],
     tracker_candidates: list[ClusterCandidate],
     candidate_diagnostics: list[dict[str, Any]],
-    segmentation_cluster_count: int,
     aruco_prior: ArucoPrior | None,
     aruco_selected_candidate: ClusterCandidate | None,
     camera_timestamp: float | None,
     sync_dt_ms: float | None,
-    segmentation_point_count: int,
-    projected_point_count: int,
     aruco_priors: list[ArucoPrior],
     used_aruco_fallback: bool,
     state: Any,
@@ -1487,9 +1477,7 @@ def format_fusion_record(
         "point_count_filtered": point_count_filtered,
         "camera_timestamp": camera_timestamp,
         "sync_dt_ms": None if sync_dt_ms is None else round(float(sync_dt_ms), 3),
-        "point_count_projected_to_front": projected_point_count,
-        "point_count_in_target_mask": segmentation_point_count,
-        "segmentation_cluster_count": int(segmentation_cluster_count),
+        "point_count_projected_to_front": 0,
         "candidate_count": len(candidates),
         "candidate_count_tracker_input": len(tracker_candidates),
         "candidates": [format_candidate(candidate) for candidate in candidates],
@@ -1548,7 +1536,6 @@ def main() -> None:
     lidar_config = load_aruco_config(args.lidar_config)
     configure_span_lidar_extrinsics(lidar_config)
     aruco_runtime_config = dict(aruco_config)
-    aruco_runtime_config["segmentation"] = dict(lidar_config.get("segmentation", {}))
     aruco_runtime_config["sync"] = dict(lidar_config.get("sync", {}))
 
     aruco_provider = ArucoPriorProvider(aruco_runtime_config)
@@ -1605,7 +1592,6 @@ def main() -> None:
     interrupted = False
     local_roi_recovery_countdown = 0
     previous_track_positions: list[np.ndarray] = []
-    segmentation_enabled = bool(lidar_config.get("segmentation", {}).get("enabled", False))
 
     try:
         while True:
@@ -1621,51 +1607,84 @@ def main() -> None:
             aruco_priors = aruco_provider.get_priors(timestamp)
             aruco_prior = None if not aruco_priors else aruco_priors[0]
             aruco_debug = aruco_provider.get_debug_state()
-            ground_cfg = dict(lidar_config.get("ground_removal", {}))
-            protect_regions = build_ground_protect_regions(previous_track_positions, aruco_priors, ground_cfg)
-            if protect_regions:
-                ground_cfg["protect_regions"] = protect_regions
-            processed = remove_ground(no_ego_points, ground_cfg)
-            point_count_after_ground_removal = int(processed.shape[0])
-            use_local_roi = local_roi_recovery_countdown <= 0
-            aruco_target_centers = [
-                np.asarray(target["center_in_target_m"], dtype=np.float64)
-                for target in aruco_debug.target_results
-                if "center_in_target_m" in target
-            ]
-            processed = apply_aruco_local_roi(
-                processed,
-                aruco_prior,
-                aruco_target_centers,
-                lidar_config.get("roi", {}),
-                reconnect_streak=0,
-                force_disable=not use_local_roi,
-            )
-            point_count_after_aruco_local_roi = int(processed.shape[0])
 
-            if segmentation_enabled:
-                segmented_points, projected_point_count = select_points_in_target_mask(
-                    points=processed,
-                    aruco_debug=aruco_debug,
+            # --- ArUco 2D ROI path: when ArUco markers are visible, use their
+            #     image region to cut LiDAR points directly, then cluster to
+            #     reject outliers.  Falls back to the original pipeline when
+            #     ArUco is not detected. ---
+            aruco_2d_roi_used = False
+            aruco_roi_centroid: np.ndarray | None = None
+
+            if aruco_debug.target_results:
+                aruco_roi_points, aruco_depth = select_points_in_aruco_roi(
+                    points=no_ego_points,
+                    aruco_target_results=aruco_debug.target_results,
                     aruco_context=aruco_provider.context,
                 )
+                if aruco_roi_points.shape[0] > 0:
+                    aruco_roi_centroid = cluster_aruco_roi_points(
+                        points=aruco_roi_points,
+                        aruco_depth_m=aruco_depth,
+                        tolerance_m=float(clustering_cfg["tolerance_m"]),
+                        min_cluster_points=int(clustering_cfg.get("min_cluster_points", 3)),
+                        max_cluster_points=int(clustering_cfg.get("max_cluster_points", 5000)),
+                    )
+                    if aruco_roi_centroid.size > 0:
+                        aruco_2d_roi_used = True
+
+            if aruco_2d_roi_used:
+                # Build a synthetic candidate from the ArUco 2D ROI cluster
+                processed = no_ego_points
+                point_count_after_ground_removal = point_count_after_ego_filter
+                point_count_after_aruco_local_roi = int(aruco_roi_points.shape[0])
+                synthetic_candidate = ClusterCandidate(
+                    cluster_id=0,
+                    point_count=int(aruco_roi_points.shape[0]),
+                    centroid=aruco_roi_centroid,
+                    footpoint=aruco_roi_centroid.copy(),
+                    size=np.zeros(3, dtype=np.float64),
+                    min_bound=aruco_roi_points.min(axis=0),
+                    max_bound=aruco_roi_points.max(axis=0),
+                    score=1.0,
+                )
+                candidates = [synthetic_candidate]
             else:
-                segmented_points = processed
-                projected_point_count = int(processed.shape[0])
-            segmented_clusters = euclidean_clusters(
-                points=segmented_points,
-                tolerance=float(clustering_cfg["tolerance_m"]),
-                min_points=int(clustering_cfg["min_cluster_points"]),
-                max_points=int(clustering_cfg["max_cluster_points"]),
-            ) if segmented_points.shape[0] > 0 else []
-            segmented_clusters = merge_vertical_person_clusters(
-                segmented_clusters,
-                xy_merge_distance_m=float(clustering_cfg.get("merge_xy_distance_m", 0.55)),
-                z_gap_m=float(clustering_cfg.get("merge_z_gap_m", 0.9)),
-                max_merged_points=int(clustering_cfg.get("merge_max_points", 8000)),
-            ) if segmented_clusters else []
-            segmentation_cluster_count = len(segmented_clusters)
-            candidates = build_target_mask_v2_candidates(segmented_clusters, lidar_config["person_cluster"])
+                # Fallback: original pipeline (ground removal + local ROI + clustering)
+                ground_cfg = dict(lidar_config.get("ground_removal", {}))
+                protect_regions = build_ground_protect_regions(previous_track_positions, aruco_priors, ground_cfg)
+                if protect_regions:
+                    ground_cfg["protect_regions"] = protect_regions
+                processed = remove_ground(no_ego_points, ground_cfg)
+                point_count_after_ground_removal = int(processed.shape[0])
+                use_local_roi = local_roi_recovery_countdown <= 0
+                aruco_target_centers = [
+                    np.asarray(target["center_in_target_m"], dtype=np.float64)
+                    for target in aruco_debug.target_results
+                    if "center_in_target_m" in target
+                ]
+                processed = apply_aruco_local_roi(
+                    processed,
+                    aruco_prior,
+                    aruco_target_centers,
+                    lidar_config.get("roi", {}),
+                    reconnect_streak=0,
+                    force_disable=not use_local_roi,
+                )
+                point_count_after_aruco_local_roi = int(processed.shape[0])
+
+                fallback_clusters = euclidean_clusters(
+                    points=processed,
+                    tolerance=float(clustering_cfg["tolerance_m"]),
+                    min_points=int(clustering_cfg["min_cluster_points"]),
+                    max_points=int(clustering_cfg["max_cluster_points"]),
+                ) if processed.shape[0] > 0 else []
+                fallback_clusters = merge_vertical_person_clusters(
+                    fallback_clusters,
+                    xy_merge_distance_m=float(clustering_cfg.get("merge_xy_distance_m", 0.55)),
+                    z_gap_m=float(clustering_cfg.get("merge_z_gap_m", 0.9)),
+                    max_merged_points=int(clustering_cfg.get("merge_max_points", 8000)),
+                ) if fallback_clusters else []
+                candidates = build_target_mask_v2_candidates(fallback_clusters, lidar_config["person_cluster"])
 
             aruco_selected_candidate = None
             tracker_candidates = list(candidates)
@@ -1716,7 +1735,6 @@ def main() -> None:
                 aruco_selected_candidate=aruco_selected_candidate,
                 aruco_debug=aruco_debug,
                 aruco_context=aruco_provider.context,
-                person_class_id=aruco_provider.segmentation_predictor.person_class_id,
             )
             record = format_fusion_record(
                 timestamp=timestamp,
@@ -1729,13 +1747,10 @@ def main() -> None:
                 candidates=candidates,
                 tracker_candidates=tracker_candidates,
                 candidate_diagnostics=candidate_diagnostics,
-                segmentation_cluster_count=segmentation_cluster_count,
                 aruco_prior=aruco_prior,
                 aruco_selected_candidate=aruco_selected_candidate,
                 camera_timestamp=aruco_debug.frame_timestamp,
                 sync_dt_ms=aruco_debug.sync_dt_ms,
-                segmentation_point_count=int(segmented_points.shape[0]),
-                projected_point_count=int(projected_point_count),
                 aruco_priors=aruco_priors,
                 used_aruco_fallback=used_aruco_fallback,
                 state=state,
@@ -1845,7 +1860,6 @@ def main() -> None:
                 if aruco_prior is not None:
                     aruco_text = (
                         f"{aruco_prior.source} pos={np.round(aruco_prior.position_lidar, 3).tolist()} "
-                        f"mask_points={segmented_points.shape[0]} "
                         f"sync_dt_ms={aruco_debug.sync_dt_ms if aruco_debug.sync_dt_ms is not None else 'none'}"
                     )
                 fused_text = "none"
