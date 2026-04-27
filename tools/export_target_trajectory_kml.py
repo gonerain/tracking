@@ -64,10 +64,6 @@ def load_gt_points(path: Path) -> list[Point]:
             continue
         points.append((utc_s, lon, lat, alt, heading))
     points.sort(key=lambda p: p[0])
-    # Downsample GT to avoid overwhelming Google Earth with huge LineStrings
-    if len(points) > 10000:
-        step = max(1, len(points) // 10000)
-        points = points[::step]
     return points
 
 
@@ -190,10 +186,18 @@ def write_kml(
     altitude_mode: str,
     sample_step: int,
 ) -> None:
-    if len(gt_points) < 2:
-        raise ValueError(f"Not enough GT points: {len(gt_points)}")
     if not target_tracks:
         raise ValueError("No valid target tracks found.")
+
+    # Clip GT to the time range of the target tracks (with 5s padding)
+    all_target_ts = [p[0] for pts in target_tracks.values() for p in pts]
+    if all_target_ts:
+        t_min = min(all_target_ts) - 5.0
+        t_max = max(all_target_ts) + 5.0
+        gt_points = [p for p in gt_points if t_min <= p[0] <= t_max]
+
+    if len(gt_points) < 2:
+        raise ValueError(f"Not enough GT points: {len(gt_points)}")
 
     target_parts: list[str] = []
     for index, (name, points) in enumerate(sorted(target_tracks.items(), key=lambda item: item[0])):
