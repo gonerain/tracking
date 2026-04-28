@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +12,7 @@ Point = Tuple[float, float, float, float, Optional[float]]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export full GT and target trajectories to Google Earth KML.")
-    parser.add_argument("--input", default="outputs/target_world_positions.jsonl", help="Input JSONL path.")
+    parser.add_argument("--input", default="outputs/target_world_positions.csv", help="Input CSV path.")
     parser.add_argument(
         "--gt-txt",
         default="data/0421-PM-2026/CollectionSystem/IE/0421-PM-2026.txt",
@@ -25,12 +24,6 @@ def parse_args() -> argparse.Namespace:
         choices=["absolute", "clampToGround", "relativeToGround"],
         default="clampToGround",
         help="KML altitude mode.",
-    )
-    parser.add_argument(
-        "--sample-step",
-        type=int,
-        default=500,
-        help="Add one detail point placemark every N points. Set <=0 to disable.",
     )
     return parser.parse_args()
 
@@ -72,41 +65,29 @@ def load_target_tracks(path: Path) -> dict[str, list[Point]]:
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {path}")
 
+    import csv
     target_tracks: dict[str, list[Point]] = {}
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        ts = item.get("timestamp")
-        if ts is None:
-            continue
-        try:
-            t = float(ts)
-        except (TypeError, ValueError):
-            continue
-
-        group_targets = item.get("aruco_group_targets")
-        if isinstance(group_targets, list) and group_targets:
-            for target in group_targets:
-                if not isinstance(target, dict):
-                    continue
-                lla = target.get("target_world_lla")
-                gid = target.get("target_group_index")
-                if gid is None or not isinstance(lla, list) or len(lla) < 3:
+    with path.open(encoding="utf-8", errors="ignore") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                t = float(row.get("utc_seconds", ""))
+            except (TypeError, ValueError):
+                continue
+            for gid in range(2):
+                prefix = f"target_{gid}"
+                lat_s = row.get(f"{prefix}_lat", "")
+                lon_s = row.get(f"{prefix}_lon", "")
+                alt_s = row.get(f"{prefix}_height", "")
+                if not lat_s or not lon_s or not alt_s:
                     continue
                 try:
-                    lat = float(lla[0])
-                    lon = float(lla[1])
-                    alt = float(lla[2])
+                    lat = float(lat_s)
+                    lon = float(lon_s)
+                    alt = float(alt_s)
                 except (TypeError, ValueError):
                     continue
-                target_tracks.setdefault(f"target_{int(gid)}", []).append((t, lon, lat, alt, None))
-            continue
+                target_tracks.setdefault(prefix, []).append((t, lon, lat, alt, None))
 
     cleaned: dict[str, list[Point]] = {}
     for name, points in target_tracks.items():
@@ -202,30 +183,11 @@ def point_placemark(name: str, point: Point, altitude_mode: str, style_url: str 
 """
 
 
-def sampled_points_folder(folder_name: str, prefix: str, points: list[Point], sample_step: int, altitude_mode: str) -> str:
-    """Return a KML Folder with sampled point placemarks with timestamps. Disabled when sample_step <= 0."""
-    if sample_step <= 0:
-        return ""
-    marks: list[str] = []
-    indices = list(range(0, len(points), sample_step))
-    if (len(points) - 1) not in indices:
-        indices.append(len(points) - 1)
-    for index in indices:
-        marks.append(point_placemark(f"{prefix}_{index}", points[index], altitude_mode, show_timestamp=True))
-    return f"""
-    <Folder>
-      <name>{folder_name}</name>
-{''.join(marks)}
-    </Folder>
-"""
-
-
 def write_kml(
     gt_points: list[Point],
     target_tracks: dict[str, list[Point]],
     out_path: Path,
     altitude_mode: str,
-    sample_step: int,
 ) -> None:
     if not target_tracks:
         raise ValueError("No valid target tracks found.")
@@ -337,10 +299,9 @@ def main() -> None:
     args = parse_args()
     gt_points = load_gt_points(Path(args.gt_txt))
     target_tracks = load_target_tracks(Path(args.input))
-    write_kml(gt_points, target_tracks, Path(args.output), args.altitude_mode, args.sample_step)
+    write_kml(gt_points, target_tracks, Path(args.output), args.altitude_mode)
     print(
-        f"saved={args.output} gt_points={len(gt_points)} target_tracks={len(target_tracks)} "
-        f"sample_step={args.sample_step}"
+        f"saved={args.output} gt_points={len(gt_points)} target_tracks={len(target_tracks)}"
     )
 
 
