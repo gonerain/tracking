@@ -13,8 +13,6 @@ defaults:
   parallel: 1
   export_kml: true
   kml_sample_step: 500
-  no_auto_calibrate_target_offsets: false
-  auto_offset_scan_frames_per_bag: 300
 
 jobs:
   - name: "0421-PM-2026"

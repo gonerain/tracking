@@ -279,6 +279,7 @@ def run_one_jobset(
     continue_on_error: bool,
     parallel: int,
     export_kml: bool,
+    kml_sample_step: int,
 ) -> dict[str, Any]:
     bags = sorted(bag_dir.glob(pattern), key=bag_sort_key)
     if not bags:
@@ -291,7 +292,7 @@ def run_one_jobset(
     if gt_path is None and isinstance(ie_cfg, dict):
         gt_path = str(ie_cfg.get("path", ""))
 
-    per_bag_csv: list[tuple[str, Path]] = []
+    per_bag_jsonl: list[tuple[str, Path]] = []
     per_bag_fusion_json: list[tuple[str, Path]] = []
     manifest: list[dict[str, Any]] = []
     failures: list[tuple[str, int]] = []
@@ -400,6 +401,7 @@ def run_one_jobset(
                 "merged_target_world_csv": str(merged_csv),
                 "merged_fusion_json": str(merged_dir / "fusion_tracking_log.json"),
                 "merged_kml": str(merged_dir / "target_trajectory.kml") if export_kml else None,
+                "calibrated_target_offsets_m": {},
                 "bags": manifest,
             },
             ensure_ascii=False,
@@ -479,6 +481,7 @@ def main() -> None:
                 continue_on_error=bool(_value_from_job_defaults_cli(raw_job, defaults, args, "continue_on_error")),
                 parallel=int(_value_from_job_defaults_cli(raw_job, defaults, args, "parallel")),
                 export_kml=bool(_value_from_job_defaults_cli(raw_job, defaults, args, "export_kml")),
+                kml_sample_step=int(_value_from_job_defaults_cli(raw_job, defaults, args, "kml_sample_step")),
             )
             summary.append(result)
             if result["failed_bags"]:
@@ -511,6 +514,7 @@ def main() -> None:
         continue_on_error=args.continue_on_error,
         parallel=args.parallel,
         export_kml=args.export_kml,
+        kml_sample_step=args.kml_sample_step,
     )
     if result["failed_bags"]:
         raise SystemExit(1)
