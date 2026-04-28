@@ -364,6 +364,8 @@ def detect_markers(image: np.ndarray, context: DetectorContext) -> list[dict[str
     for marker_id, corner, (rvec, tvec) in zip(ids.flatten().tolist(), corners, poses):
         rotation_marker_from_camera, translation_marker_from_camera = rvec_tvec_to_matrix(rvec, tvec)
         center_camera = translation_marker_from_camera
+        if center_camera[2] <= 0:
+            continue
         center_target = camera_point_to_target_frame(
             center_camera,
             context.rotation_target_from_camera,
