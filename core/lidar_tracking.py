@@ -102,11 +102,46 @@ class RosbagLidarSource:
 
         raise RuntimeError("Failed to construct ROS time; neither genpy.Time nor rospy.Time is available")
 
+    _LIVOX_POINT_DTYPE = np.dtype([
+        ("offset_time", "<u4"),
+        ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+        ("reflectivity", "u1"), ("tag", "u1"), ("line", "u1"),
+    ])
+
     def _open_bag(self) -> None:
         self._bag = self.rosbag.Bag(self.bag_path, "r")
         start_time = self._make_ros_time(self.start_time_s)
         end_time = self._make_ros_time(self.end_time_s)
-        self._iterator = self._bag.read_messages(topics=[self.topic], start_time=start_time, end_time=end_time)
+        self._iterator = self._bag.read_messages(
+            topics=[self.topic], start_time=start_time, end_time=end_time, raw=True,
+        )
+
+    @staticmethod
+    def _livox_raw_to_points(raw_bytes: bytes) -> np.ndarray:
+        """Parse Livox CustomMsg from raw serialised bytes using numpy.
+
+        This bypasses genpy per-point deserialization (~100x faster).
+        """
+        import struct as _struct
+
+        offset = 4  # skip seq (uint32)
+        offset += 4 + 4  # stamp secs + nsecs
+        frame_id_len = _struct.unpack_from("<I", raw_bytes, offset)[0]
+        offset += 4 + frame_id_len  # frame_id length + string
+        offset += 8  # timebase (uint64)
+        point_num = _struct.unpack_from("<I", raw_bytes, offset)[0]
+        offset += 4
+        offset += 1 + 3  # lidar_id + rsvd
+
+        point_data = np.frombuffer(
+            raw_bytes,
+            dtype=RosbagLidarSource._LIVOX_POINT_DTYPE,
+            offset=offset,
+            count=point_num,
+        )
+        return np.column_stack([
+            point_data["x"], point_data["y"], point_data["z"],
+        ]).astype(np.float64)
 
     def _livox_msg_to_points(self, msg: Any) -> np.ndarray:
         if getattr(msg, "_type", "") != "livox_ros_driver2/CustomMsg":
@@ -126,7 +161,11 @@ class RosbagLidarSource:
                 self._open_bag()
                 continue
 
-            points = self._livox_msg_to_points(msg)
+            # msg is a raw tuple: (msg_type, serialized_bytes, md5, pos, pytype)
+            if isinstance(msg, tuple):
+                points = self._livox_raw_to_points(msg[1])
+            else:
+                points = self._livox_msg_to_points(msg)
             return True, points, stamp.to_sec()
 
     def release(self) -> None:
@@ -544,6 +583,23 @@ def pairwise_distances(points: np.ndarray) -> np.ndarray:
     return np.sqrt(np.sum(deltas * deltas, axis=2))
 
 
+def _connected_component_labels(num_points: int, pair_indices: np.ndarray) -> np.ndarray:
+    """Compute connected-component labels using scipy's C implementation."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    if pair_indices.size == 0:
+        return np.arange(num_points, dtype=np.int32)
+
+    ones = np.ones(pair_indices.shape[0], dtype=np.int8)
+    graph = csr_matrix(
+        (ones, (pair_indices[:, 0], pair_indices[:, 1])),
+        shape=(num_points, num_points),
+    )
+    _, labels = connected_components(graph, directed=False)
+    return labels
+
+
 def _cluster_points_ckdtree(
     points: np.ndarray,
     tolerance: float,
@@ -554,42 +610,18 @@ def _cluster_points_ckdtree(
     tree = cKDTree(points[:, :3])
     pair_indices = tree.query_pairs(float(tolerance), output_type="ndarray")
 
-    parents = np.arange(num_points, dtype=np.int32)
-    ranks = np.zeros(num_points, dtype=np.uint8)
+    labels = _connected_component_labels(num_points, pair_indices)
 
-    def find(index: int) -> int:
-        while parents[index] != index:
-            parents[index] = parents[parents[index]]
-            index = int(parents[index])
-        return index
+    # Group indices by component label
+    order = np.argsort(labels, kind="stable")
+    sorted_roots = labels[order]
+    split_positions = np.flatnonzero(np.diff(sorted_roots)) + 1
+    groups = np.split(order, split_positions)
 
-    def union(a: int, b: int) -> None:
-        root_a = find(a)
-        root_b = find(b)
-        if root_a == root_b:
-            return
-        if ranks[root_a] < ranks[root_b]:
-            parents[root_a] = root_b
-            return
-        if ranks[root_a] > ranks[root_b]:
-            parents[root_b] = root_a
-            return
-        parents[root_b] = root_a
-        ranks[root_a] += 1
-
-    for a, b in pair_indices:
-        union(int(a), int(b))
-
-    root_to_indices: dict[int, list[int]] = {}
-    for index in range(num_points):
-        root = find(index)
-        root_to_indices.setdefault(root, []).append(index)
-
-    ordered_clusters = sorted(root_to_indices.values(), key=lambda indices: indices[0])
     clusters: list[np.ndarray] = []
-    for member_indices in ordered_clusters:
-        if min_points <= len(member_indices) <= max_points:
-            clusters.append(points[np.asarray(member_indices, dtype=np.int32)])
+    for member_indices in groups:
+        if min_points <= member_indices.shape[0] <= max_points:
+            clusters.append(points[member_indices])
     return clusters
 
 
@@ -1488,14 +1520,28 @@ class JsonRecordWriter:
         self.flush_every_frame = flush_every_frame
         self.records: list[dict[str, Any]] = []
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = None
+        if self.flush_every_frame:
+            self._file = open(self.output_path, "w", encoding="utf-8")
+            self._file.write("[\n")
+            self._first = True
 
     def append(self, record: dict[str, Any]) -> None:
         self.records.append(record)
-        if self.flush_every_frame:
-            self.flush()
+        if self.flush_every_frame and self._file is not None:
+            if not self._first:
+                self._file.write(",\n")
+            self._first = False
+            self._file.write(json.dumps(record, ensure_ascii=False, indent=2))
+            self._file.flush()
 
     def flush(self) -> None:
-        self.output_path.write_text(json.dumps(self.records, ensure_ascii=False, indent=2), encoding="utf-8")
+        if self._file is not None:
+            self._file.write("\n]\n")
+            self._file.close()
+            self._file = None
+        else:
+            self.output_path.write_text(json.dumps(self.records, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:

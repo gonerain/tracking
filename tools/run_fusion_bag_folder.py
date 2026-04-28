@@ -285,8 +285,6 @@ def run_one_jobset(
     parallel: int,
     export_kml: bool,
     kml_sample_step: int,
-    no_auto_calibrate_target_offsets: bool,
-    auto_offset_scan_frames_per_bag: int,
 ) -> dict[str, Any]:
     bags = sorted(bag_dir.glob(pattern), key=bag_sort_key)
     if not bags:
@@ -298,17 +296,6 @@ def run_one_jobset(
     gt_path = ie_path_override
     if gt_path is None and isinstance(ie_cfg, dict):
         gt_path = str(ie_cfg.get("path", ""))
-
-    calibrated_offsets: dict[int, list[float]] = {}
-    if not no_auto_calibrate_target_offsets:
-        print(f"[{job_name}] auto-calibrating ArUco target offsets from bag folder...")
-        calibrated_offsets = auto_calibrate_target_offsets(
-            bags,
-            aruco_config,
-            frames_per_bag=int(auto_offset_scan_frames_per_bag),
-        )
-        apply_calibrated_offsets(aruco_config, calibrated_offsets)
-        print(f"[{job_name}] calibrated_offsets={{{', '.join(f'{k}: {v}' for k, v in sorted(calibrated_offsets.items()))}}}")
 
     per_bag_jsonl: list[tuple[str, Path]] = []
     per_bag_fusion_json: list[tuple[str, Path]] = []
@@ -421,7 +408,7 @@ def run_one_jobset(
                 "merged_target_world_jsonl": str(merged_jsonl),
                 "merged_fusion_json": str(merged_dir / "fusion_tracking_log.json"),
                 "merged_kml": str(merged_dir / "target_trajectory.kml") if export_kml else None,
-                "calibrated_target_offsets_m": {str(k): v for k, v in sorted(calibrated_offsets.items())},
+                "calibrated_target_offsets_m": {},
                 "bags": manifest,
             },
             ensure_ascii=False,
@@ -502,12 +489,6 @@ def main() -> None:
                 parallel=int(_value_from_job_defaults_cli(raw_job, defaults, args, "parallel")),
                 export_kml=bool(_value_from_job_defaults_cli(raw_job, defaults, args, "export_kml")),
                 kml_sample_step=int(_value_from_job_defaults_cli(raw_job, defaults, args, "kml_sample_step")),
-                no_auto_calibrate_target_offsets=bool(
-                    _value_from_job_defaults_cli(raw_job, defaults, args, "no_auto_calibrate_target_offsets")
-                ),
-                auto_offset_scan_frames_per_bag=int(
-                    _value_from_job_defaults_cli(raw_job, defaults, args, "auto_offset_scan_frames_per_bag")
-                ),
             )
             summary.append(result)
             if result["failed_bags"]:
@@ -541,8 +522,6 @@ def main() -> None:
         parallel=args.parallel,
         export_kml=args.export_kml,
         kml_sample_step=args.kml_sample_step,
-        no_auto_calibrate_target_offsets=args.no_auto_calibrate_target_offsets,
-        auto_offset_scan_frames_per_bag=args.auto_offset_scan_frames_per_bag,
     )
     if result["failed_bags"]:
         raise SystemExit(1)
