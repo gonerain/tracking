@@ -1,0 +1,31 @@
+# Multi-folder batch config for tools/run_fusion_bag_folder.py
+# Usage:
+#   python3 tools/run_fusion_bag_folder.py --batch-config configs/fusion_bag_batch_example.yaml
+
+output_root: outputs/fusion_batch_multi
+
+defaults:
+  pattern: "*.bag"
+  aruco_config: configs/aruco_config.yaml
+  lidar_config: configs/lidar_config.yaml
+  skip_existing: true
+  continue_on_error: true
+  parallel: 1
+  export_kml: true
+  kml_sample_step: 500
+  no_auto_calibrate_target_offsets: false
+  auto_offset_scan_frames_per_bag: 300
+
+jobs:
+  - name: "0421-PM-2026"
+    bag_dir: "data/0421-AM-2026/CollectionSystem/2026-04-21_whampoa-deepurban-walk-001/rosbag"
+    ie_path: "data/0421-AM-2026/CollectionSystem/IE/0421-AM-2026.txt"
+
+  - name: "0422-AM-2026"
+    bag_dir: "data/0421-PM-2026/CollectionSystem/2026-04-21_whampoa-deepurban-walk-002/rosbag"
+    ie_path: "data/0421-PM-2026/CollectionSystem/IE/0421-PM-2026.txt"
+
+    # Optional per-job override:
+    # output_dir: "outputs/fusion_batch_multi/custom_0423"
+    # parallel: 2
+    # skip_existing: false

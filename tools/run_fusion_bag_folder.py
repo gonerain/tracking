@@ -22,6 +22,11 @@ if str(ROOT) not in sys.path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run fusion tracking for every bag in a folder.")
     parser.add_argument(
+        "--batch-config",
+        default=None,
+        help="YAML config for multiple bag folders. When set, per-folder settings come from config jobs[].",
+    )
+    parser.add_argument(
         "--bag-dir",
         default="data/2026-04-20_whampoa-suburban-walk-001/rosbag",
         help="Folder containing .bag files.",
@@ -68,6 +73,30 @@ def write_yaml(path: Path, data: dict[str, Any]) -> None:
 
 def bag_sort_key(path: Path) -> tuple[str, str]:
     return (path.stem, path.name)
+
+
+def setup_batch_logger(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(str(log_path), mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(message)s"))
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("batch")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
+    import builtins
+
+    def _log_print(*args_p, **kwargs_p):
+        _ = kwargs_p
+        msg = " ".join(str(a) for a in args_p)
+        logger.info(msg)
+
+    builtins.print = _log_print
 
 
 def set_nested(mapping: dict[str, Any], keys: list[str], value: Any) -> None:
@@ -242,53 +271,50 @@ def process_single_bag(
     }
 
 
-def main() -> None:
-    args = parse_args()
-    bag_dir = repo_path(args.bag_dir)
-    output_dir = repo_path(args.output_dir)
-    aruco_config_path = repo_path(args.aruco_config)
-    lidar_config_path = repo_path(args.lidar_config)
-
-    # Write batch log to output directory
-    output_dir.mkdir(parents=True, exist_ok=True)
-    batch_log_path = output_dir / "batch_run.log"
-    file_handler = logging.FileHandler(str(batch_log_path), mode="w", encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter("%(message)s"))
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(logging.INFO)
-    stream_handler.setFormatter(logging.Formatter("%(message)s"))
-    logger = logging.getLogger("batch")
-    logger.setLevel(logging.INFO)
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-    # Redirect print to logger
-    _orig_print = print
-    import builtins
-    def _log_print(*args_p, **kwargs_p):
-        msg = " ".join(str(a) for a in args_p)
-        logger.info(msg)
-    builtins.print = _log_print
-
-    bags = sorted(bag_dir.glob(args.pattern), key=bag_sort_key)
+def run_one_jobset(
+    *,
+    job_name: str,
+    bag_dir: Path,
+    output_dir: Path,
+    aruco_config_path: Path,
+    lidar_config_path: Path,
+    pattern: str,
+    ie_path_override: str | None,
+    skip_existing: bool,
+    continue_on_error: bool,
+    parallel: int,
+    export_kml: bool,
+    kml_sample_step: int,
+    no_auto_calibrate_target_offsets: bool,
+    auto_offset_scan_frames_per_bag: int,
+) -> dict[str, Any]:
+    bags = sorted(bag_dir.glob(pattern), key=bag_sort_key)
     if not bags:
-        raise FileNotFoundError(f"No bags found: {bag_dir}/{args.pattern}")
+        raise FileNotFoundError(f"No bags found: {bag_dir}/{pattern}")
 
     aruco_config = load_yaml(aruco_config_path)
     lidar_config = load_yaml(lidar_config_path)
     ie_cfg = lidar_config.get("ie_pose", {})
-    gt_path = args.ie_path
+    gt_path = ie_path_override
     if gt_path is None and isinstance(ie_cfg, dict):
         gt_path = str(ie_cfg.get("path", ""))
 
     calibrated_offsets: dict[int, list[float]] = {}
+    if not no_auto_calibrate_target_offsets:
+        print(f"[{job_name}] auto-calibrating ArUco target offsets from bag folder...")
+        calibrated_offsets = auto_calibrate_target_offsets(
+            bags,
+            aruco_config,
+            frames_per_bag=int(auto_offset_scan_frames_per_bag),
+        )
+        apply_calibrated_offsets(aruco_config, calibrated_offsets)
+        print(f"[{job_name}] calibrated_offsets={{{', '.join(f'{k}: {v}' for k, v in sorted(calibrated_offsets.items()))}}}")
 
     per_bag_jsonl: list[tuple[str, Path]] = []
     per_bag_fusion_json: list[tuple[str, Path]] = []
     manifest: list[dict[str, Any]] = []
     failures: list[tuple[str, int]] = []
 
-    # Build job list
     jobs: list[dict[str, Any]] = []
     for bag_path in bags:
         bag_name = bag_path.stem
@@ -302,29 +328,27 @@ def main() -> None:
             "bag_out_dir": bag_out_dir,
             "aruco_config": aruco_config,
             "lidar_config": lidar_config,
-            "ie_path": args.ie_path,
-            "export_kml": args.export_kml,
-            "kml_sample_step": args.kml_sample_step,
+            "ie_path": ie_path_override,
+            "export_kml": export_kml,
+            "kml_sample_step": kml_sample_step,
             "gt_path": gt_path,
-            "skip_existing": args.skip_existing,
+            "skip_existing": skip_existing,
         })
 
-    max_workers = max(int(args.parallel), 1)
+    max_workers = max(int(parallel), 1)
 
     if max_workers == 1:
-        # Sequential processing
         for index, job in enumerate(jobs, start=1):
-            print(f"[{index}/{len(jobs)}] bag={job['bag_path']}")
+            print(f"[{job_name}] [{index}/{len(jobs)}] bag={job['bag_path']}")
             result = process_single_bag(**job)
-            print(f"  status={result['status']}")
+            print(f"[{job_name}]   status={result['status']}")
             manifest.append(result)
             if result["status"] == "failed":
                 failures.append((result["bag_name"], result["returncode"]))
-                if not args.continue_on_error:
+                if not continue_on_error:
                     break
     else:
-        # Parallel processing
-        print(f"Processing {len(jobs)} bags with {max_workers} parallel workers...")
+        print(f"[{job_name}] Processing {len(jobs)} bags with {max_workers} parallel workers...")
         future_to_index: dict[Any, int] = {}
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             for index, job in enumerate(jobs):
@@ -347,12 +371,11 @@ def main() -> None:
                         "run_log": str(jobs[index]["bag_out_dir"] / "run.log"),
                         "kml": None,
                     }
-                    print(f"  [{index+1}/{len(jobs)}] EXCEPTION bag={jobs[index]['bag_path'].name}: {exc}")
-                print(f"  [{index+1}/{len(jobs)}] {result['bag_name']}: {result['status']}")
+                    print(f"[{job_name}]   [{index+1}/{len(jobs)}] EXCEPTION bag={jobs[index]['bag_path'].name}: {exc}")
+                print(f"[{job_name}]   [{index+1}/{len(jobs)}] {result['bag_name']}: {result['status']}")
                 if result["status"] == "failed":
                     failures.append((result["bag_name"], result["returncode"]))
 
-        # Collect results in original order
         results_by_bag: dict[str, dict[str, Any]] = {}
         for future in future_to_index:
             try:
@@ -370,33 +393,34 @@ def main() -> None:
     merged_count = merge_jsonl(per_bag_jsonl, merged_jsonl)
     merged_fusion_count = merge_fusion_json(per_bag_fusion_json, merged_dir / "fusion_tracking_log.json")
 
-    print(f"merged target jsonl: {merged_jsonl} records={merged_count}")
+    print(f"[{job_name}] merged target jsonl: {merged_jsonl} records={merged_count}")
     if merged_fusion_count:
-        print(f"merged fusion json: {merged_dir / 'fusion_tracking_log.json'} records={merged_fusion_count}")
+        print(f"[{job_name}] merged fusion json: {merged_dir / 'fusion_tracking_log.json'} records={merged_fusion_count}")
 
-    if args.export_kml and merged_count > 0:
+    if export_kml and merged_count > 0:
         kml_code = export_kml_func(
             merged_jsonl,
             merged_dir / "target_trajectory.kml",
             gt_path,
-            args.kml_sample_step,
+            kml_sample_step,
             merged_dir / "kml_export.log",
         )
         if kml_code == 0:
-            print(f"merged kml: {merged_dir / 'target_trajectory.kml'}")
+            print(f"[{job_name}] merged kml: {merged_dir / 'target_trajectory.kml'}")
         else:
-            print(f"merged kml export failed returncode={kml_code}; log={merged_dir / 'kml_export.log'}")
+            print(f"[{job_name}] merged kml export failed returncode={kml_code}; log={merged_dir / 'kml_export.log'}")
 
     manifest_path = output_dir / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
         json.dumps(
             {
+                "job_name": job_name,
                 "bag_dir": str(bag_dir),
                 "bag_count": len(bags),
                 "merged_target_world_jsonl": str(merged_jsonl),
                 "merged_fusion_json": str(merged_dir / "fusion_tracking_log.json"),
-                "merged_kml": str(merged_dir / "target_trajectory.kml") if args.export_kml else None,
+                "merged_kml": str(merged_dir / "target_trajectory.kml") if export_kml else None,
                 "calibrated_target_offsets_m": {str(k): v for k, v in sorted(calibrated_offsets.items())},
                 "bags": manifest,
             },
@@ -405,12 +429,122 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
-    print(f"manifest: {manifest_path}")
+    print(f"[{job_name}] manifest: {manifest_path}")
 
     if failures:
-        print("failed bags:")
+        print(f"[{job_name}] failed bags:")
         for bag_name, returncode in failures:
-            print(f"  {bag_name}: returncode={returncode}")
+            print(f"[{job_name}]   {bag_name}: returncode={returncode}")
+
+    return {
+        "job_name": job_name,
+        "bag_dir": str(bag_dir),
+        "output_dir": str(output_dir),
+        "manifest": str(manifest_path),
+        "failed_bags": [{"bag_name": name, "returncode": rc} for name, rc in failures],
+        "bag_count": len(bags),
+    }
+
+
+def _value_from_job_defaults_cli(job: dict[str, Any], defaults: dict[str, Any], cli: argparse.Namespace, key: str) -> Any:
+    if key in job:
+        return job[key]
+    if key in defaults:
+        return defaults[key]
+    return getattr(cli, key)
+
+
+def main() -> None:
+    args = parse_args()
+    batch_config_path = repo_path(args.batch_config) if args.batch_config else None
+
+    if batch_config_path:
+        batch_config = load_yaml(batch_config_path)
+        defaults = batch_config.get("defaults", {})
+        if defaults is None:
+            defaults = {}
+        if not isinstance(defaults, dict):
+            raise ValueError("batch config: defaults must be a mapping")
+        raw_jobs = batch_config.get("jobs", [])
+        if not isinstance(raw_jobs, list) or not raw_jobs:
+            raise ValueError("batch config: jobs must be a non-empty list")
+
+        output_root = batch_config.get("output_root", args.output_dir)
+        output_root_path = repo_path(output_root)
+        output_root_path.mkdir(parents=True, exist_ok=True)
+        setup_batch_logger(output_root_path / "batch_run.log")
+
+        print(f"batch config: {batch_config_path}")
+        print(f"output root: {output_root_path}")
+        summary: list[dict[str, Any]] = []
+        failed_job_names: list[str] = []
+
+        for index, raw_job in enumerate(raw_jobs, start=1):
+            if not isinstance(raw_job, dict):
+                raise ValueError(f"batch config: jobs[{index-1}] must be a mapping")
+            job_name = str(raw_job.get("name", f"job_{index:02d}"))
+            bag_dir = raw_job.get("bag_dir")
+            if not bag_dir:
+                raise ValueError(f"batch config: jobs[{index-1}].bag_dir is required")
+            job_output_dir = raw_job.get("output_dir", str(output_root_path / job_name))
+
+            print(f"[batch] start job {index}/{len(raw_jobs)} name={job_name}")
+            result = run_one_jobset(
+                job_name=job_name,
+                bag_dir=repo_path(str(bag_dir)),
+                output_dir=repo_path(str(job_output_dir)),
+                aruco_config_path=repo_path(str(_value_from_job_defaults_cli(raw_job, defaults, args, "aruco_config"))),
+                lidar_config_path=repo_path(str(_value_from_job_defaults_cli(raw_job, defaults, args, "lidar_config"))),
+                pattern=str(_value_from_job_defaults_cli(raw_job, defaults, args, "pattern")),
+                ie_path_override=_value_from_job_defaults_cli(raw_job, defaults, args, "ie_path"),
+                skip_existing=bool(_value_from_job_defaults_cli(raw_job, defaults, args, "skip_existing")),
+                continue_on_error=bool(_value_from_job_defaults_cli(raw_job, defaults, args, "continue_on_error")),
+                parallel=int(_value_from_job_defaults_cli(raw_job, defaults, args, "parallel")),
+                export_kml=bool(_value_from_job_defaults_cli(raw_job, defaults, args, "export_kml")),
+                kml_sample_step=int(_value_from_job_defaults_cli(raw_job, defaults, args, "kml_sample_step")),
+                no_auto_calibrate_target_offsets=bool(
+                    _value_from_job_defaults_cli(raw_job, defaults, args, "no_auto_calibrate_target_offsets")
+                ),
+                auto_offset_scan_frames_per_bag=int(
+                    _value_from_job_defaults_cli(raw_job, defaults, args, "auto_offset_scan_frames_per_bag")
+                ),
+            )
+            summary.append(result)
+            if result["failed_bags"]:
+                failed_job_names.append(job_name)
+                if not bool(_value_from_job_defaults_cli(raw_job, defaults, args, "continue_on_error")):
+                    print(f"[batch] stop on failed job: {job_name}")
+                    break
+            print(f"[batch] done job {index}/{len(raw_jobs)} name={job_name}")
+
+        summary_path = output_root_path / "batch_manifest.json"
+        summary_path.write_text(json.dumps({"jobs": summary}, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[batch] summary manifest: {summary_path}")
+        if failed_job_names:
+            raise SystemExit(1)
+        return
+
+    bag_dir = repo_path(args.bag_dir)
+    output_dir = repo_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    setup_batch_logger(output_dir / "batch_run.log")
+    result = run_one_jobset(
+        job_name="single",
+        bag_dir=bag_dir,
+        output_dir=output_dir,
+        aruco_config_path=repo_path(args.aruco_config),
+        lidar_config_path=repo_path(args.lidar_config),
+        pattern=args.pattern,
+        ie_path_override=args.ie_path,
+        skip_existing=args.skip_existing,
+        continue_on_error=args.continue_on_error,
+        parallel=args.parallel,
+        export_kml=args.export_kml,
+        kml_sample_step=args.kml_sample_step,
+        no_auto_calibrate_target_offsets=args.no_auto_calibrate_target_offsets,
+        auto_offset_scan_frames_per_bag=args.auto_offset_scan_frames_per_bag,
+    )
+    if result["failed_bags"]:
         raise SystemExit(1)
 
 
