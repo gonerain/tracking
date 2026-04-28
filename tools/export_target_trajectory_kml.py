@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -117,7 +118,8 @@ def load_target_tracks(path: Path) -> dict[str, list[Point]]:
 
 def color_for_track(index: int) -> str:
     # KML color format: aabbggrr.
-    palette = ["ff3c78d8", "ff00a5ff", "ff32cd32", "ffebce87", "ff7b68ee", "ff1493ff"]
+    # target_0 = green, target_1 = yellow, then cycle
+    palette = ["ff00ff00", "ff00ffff", "ffff0000", "ffff00ff", "ffffff00"]
     return palette[index % len(palette)]
 
 
@@ -127,6 +129,40 @@ def coords(points: list[Point]) -> str:
 
 def utc_s(ts: float) -> str:
     return f"{float(ts):.0f}s"
+
+
+def unix_to_iso8601(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def gx_track(points: list[Point], altitude_mode: str, schema_id: str) -> str:
+    """Render a gx:Track with per-point timestamps in ExtendedData.
+
+    Each point has a <when> entry and the same timestamp is stored in
+    ExtendedData so Google Earth shows it in the info balloon on click.
+    """
+    whens = "\n".join(f"        <when>{unix_to_iso8601(t)}</when>" for t, *_ in points)
+    coords_gx = "\n".join(
+        f"        <gx:coord>{lon:.9f} {lat:.9f} {alt:.3f}</gx:coord>"
+        for _, lon, lat, alt, _ in points
+    )
+    ts_values = "\n".join(
+        f"          <gx:value>{t:.3f}</gx:value>" for t, *_ in points
+    )
+    return (
+        f"      <gx:Track>\n"
+        f"        <altitudeMode>{altitude_mode}</altitudeMode>\n"
+        f"{whens}\n"
+        f"{coords_gx}\n"
+        f"        <ExtendedData>\n"
+        f"          <SchemaData schemaUrl=\"#{schema_id}\">\n"
+        f"            <gx:SimpleArrayData name=\"utc_seconds\">\n"
+        f"{ts_values}\n"
+        f"            </gx:SimpleArrayData>\n"
+        f"          </SchemaData>\n"
+        f"        </ExtendedData>\n"
+        f"      </gx:Track>"
+    )
 
 
 def desc_for_track(points: list[Point]) -> str:
@@ -145,15 +181,19 @@ def desc_for_track(points: list[Point]) -> str:
     )
 
 
-def point_placemark(name: str, point: Point, altitude_mode: str, style_url: str = "") -> str:
+def point_placemark(name: str, point: Point, altitude_mode: str, style_url: str = "", show_timestamp: bool = False) -> str:
     t, lon, lat, alt, heading = point
     style = f"<styleUrl>{style_url}</styleUrl>" if style_url else ""
     heading_part = "" if heading is None else f"<br/>heading_deg={heading:.6f}"
+    iso = unix_to_iso8601(t)
+    timestamp_elem = f"<TimeStamp><when>{iso}</when></TimeStamp>" if show_timestamp else ""
+    label = iso if show_timestamp else name
     return f"""
       <Placemark>
-        <name>{name}</name>
+        <name>{label}</name>
         {style}
-        <description><![CDATA[utc={utc_s(t)}<br/>lon={lon:.9f}<br/>lat={lat:.9f}<br/>alt={alt:.3f}{heading_part}]]></description>
+        {timestamp_elem}
+        <description><![CDATA[utc={utc_s(t)}<br/>datetime={iso}<br/>lon={lon:.9f}<br/>lat={lat:.9f}<br/>alt={alt:.3f}{heading_part}]]></description>
         <Point>
           <altitudeMode>{altitude_mode}</altitudeMode>
           <coordinates>{lon:.9f},{lat:.9f},{alt:.3f}</coordinates>
@@ -163,14 +203,15 @@ def point_placemark(name: str, point: Point, altitude_mode: str, style_url: str 
 
 
 def sampled_points_folder(folder_name: str, prefix: str, points: list[Point], sample_step: int, altitude_mode: str) -> str:
-    """Return a KML Folder with sampled point placemarks. Disabled when sample_step <= 0."""
+    """Return a KML Folder with sampled point placemarks with timestamps. Disabled when sample_step <= 0."""
     if sample_step <= 0:
         return ""
     marks: list[str] = []
-    for index in range(0, len(points), sample_step):
-        marks.append(point_placemark(f"{prefix}_{index}", points[index], altitude_mode))
-    if (len(points) - 1) % sample_step != 0:
-        marks.append(point_placemark(f"{prefix}_{len(points) - 1}", points[-1], altitude_mode))
+    indices = list(range(0, len(points), sample_step))
+    if (len(points) - 1) not in indices:
+        indices.append(len(points) - 1)
+    for index in indices:
+        marks.append(point_placemark(f"{prefix}_{index}", points[index], altitude_mode, show_timestamp=True))
     return f"""
     <Folder>
       <name>{folder_name}</name>
@@ -207,8 +248,14 @@ def write_kml(
     target_parts: list[str] = []
     for index, (name, points) in enumerate(sorted(target_tracks.items(), key=lambda item: item[0])):
         color = color_for_track(index)
+        schema_id = f"{name}_schema"
         target_parts.append(
             f"""
+    <Schema name="{schema_id}" id="{schema_id}">
+      <gx:SimpleArrayField name="utc_seconds" type="xsd:string">
+        <displayName>UTC Seconds</displayName>
+      </gx:SimpleArrayField>
+    </Schema>
     <Style id="{name}_line">
       <LineStyle>
         <color>{color}</color>
@@ -222,23 +269,16 @@ def write_kml(
         <name>{name}_track</name>
         <styleUrl>#{name}_line</styleUrl>
         <description><![CDATA[{desc_for_track(points)}]]></description>
-        <LineString>
-          <tessellate>1</tessellate>
-          <altitudeMode>{altitude_mode}</altitudeMode>
-          <coordinates>
-{coords(points)}
-          </coordinates>
-        </LineString>
+{gx_track(points, altitude_mode, schema_id)}
       </Placemark>
-{point_placemark(f"{name}_start", points[0], altitude_mode, "#startPoint")}
-{point_placemark(f"{name}_end", points[-1], altitude_mode, "#endPoint")}
+{point_placemark(f"{name}_start", points[0], altitude_mode, "#startPoint", show_timestamp=True)}
+{point_placemark(f"{name}_end", points[-1], altitude_mode, "#endPoint", show_timestamp=True)}
     </Folder>
 """
         )
-        # sampled point placemarks disabled — GT and targets render as lines only
 
     kml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
   <Document>
     <name>Full GT and Target Trajectories</name>
     <description><![CDATA[

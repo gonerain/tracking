@@ -31,7 +31,7 @@ roi:
     min_points_after_crop: 180
 
 ego_vehicle_filter:
-  enabled: true
+  enabled: false
   x: [-2.5, 1.5]
   y: [-1.2, 1.2]
   z: [-2.0, 2.0]

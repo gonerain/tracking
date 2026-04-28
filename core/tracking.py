@@ -175,105 +175,6 @@ def target_ids_label(target_ids: list[int] | list[list[int]]) -> str:
     return ",".join(str(target_id) for target_id in target_ids)
 
 
-def get_target_offsets(tracking_cfg: dict[str, Any], target_ids: list[int]) -> dict[int, np.ndarray]:
-    offsets_cfg = tracking_cfg.get("target_offsets_m", {})
-    offsets: dict[int, np.ndarray] = {}
-    for target_id in target_ids:
-        raw_value = offsets_cfg.get(str(target_id), offsets_cfg.get(target_id))
-        if raw_value is None:
-            continue
-        offsets[target_id] = np.asarray(raw_value, dtype=np.float64).reshape(3)
-    return offsets
-
-
-def estimate_group_center_from_markers(marker_centers: list[np.ndarray]) -> np.ndarray | None:
-    if len(marker_centers) >= 4:
-        return np.mean(np.stack(marker_centers, axis=0), axis=0)
-    if len(marker_centers) == 3:
-        # For three visible corners of a square, the longest pair is the diagonal;
-        # its midpoint is the square center.
-        best_pair: tuple[int, int] | None = None
-        best_distance = -1.0
-        for i in range(3):
-            for j in range(i + 1, 3):
-                distance = float(np.linalg.norm(marker_centers[i] - marker_centers[j]))
-                if distance > best_distance:
-                    best_distance = distance
-                    best_pair = (i, j)
-        if best_pair is None:
-            return None
-        return 0.5 * (marker_centers[best_pair[0]] + marker_centers[best_pair[1]])
-    return None
-
-
-def estimate_square_layout_from_visible_markers(
-    marker_centers_by_id: dict[int, np.ndarray],
-    target_id_list: list[int],
-) -> dict[Any, np.ndarray]:
-    visible_ids = list(marker_centers_by_id.keys())
-    if len(visible_ids) >= 4:
-        visible_ids = visible_ids[:4]
-        center = np.mean(np.stack([marker_centers_by_id[target_id] for target_id in visible_ids], axis=0), axis=0)
-        layout: dict[Any, np.ndarray] = {target_id: marker_centers_by_id[target_id] for target_id in visible_ids}
-        layout["__center__"] = center
-        return layout
-
-    if len(visible_ids) == 3 and len(target_id_list) == 4:
-        best_pair: tuple[int, int] | None = None
-        best_distance = -1.0
-        for i in range(3):
-            for j in range(i + 1, 3):
-                distance = float(np.linalg.norm(marker_centers_by_id[visible_ids[i]] - marker_centers_by_id[visible_ids[j]]))
-                if distance > best_distance:
-                    best_distance = distance
-                    best_pair = (i, j)
-        if best_pair is None:
-            return {}
-        diagonal_ids = {visible_ids[best_pair[0]], visible_ids[best_pair[1]]}
-        right_angle_id = next(target_id for target_id in visible_ids if target_id not in diagonal_ids)
-        missing_ids = [target_id for target_id in target_id_list if target_id not in marker_centers_by_id]
-        if len(missing_ids) != 1:
-            return {}
-        center = 0.5 * (
-            marker_centers_by_id[visible_ids[best_pair[0]]] + marker_centers_by_id[visible_ids[best_pair[1]]]
-        )
-        missing_center = 2.0 * center - marker_centers_by_id[right_angle_id]
-        layout = dict(marker_centers_by_id)
-        layout[missing_ids[0]] = missing_center
-        layout["__center__"] = center  # type: ignore[index]
-        return layout
-
-    return {}
-
-
-def estimate_target_offsets_from_results(
-    results: list[dict[str, Any]],
-    target_id_groups: list[list[int]],
-    min_visible_markers: int = 3,
-) -> dict[int, np.ndarray]:
-    offsets: dict[int, np.ndarray] = {}
-    min_visible_markers = max(int(min_visible_markers), 3)
-    for target_id_list in target_id_groups:
-        matched = [
-            result
-            for result in results
-            if int(result["id"]) in set(target_id_list) and "center_in_target_m" in result
-        ]
-        if len(matched) < min_visible_markers:
-            continue
-        marker_centers_by_id = {
-            int(result["id"]): np.asarray(result["center_in_target_m"], dtype=np.float64).reshape(3)
-            for result in matched
-        }
-        layout = estimate_square_layout_from_visible_markers(marker_centers_by_id, target_id_list)
-        group_center = layout.pop("__center__", None)
-        if group_center is None:
-            continue
-        for target_id, marker_center in layout.items():
-            offsets[int(target_id)] = np.asarray(group_center, dtype=np.float64) - marker_center
-    return offsets
-
-
 def _normalize_target_groups(target_ids: int | list[int] | list[list[int]]) -> list[list[int]]:
     if isinstance(target_ids, int):
         return [[int(target_ids)]]
@@ -288,41 +189,20 @@ def _build_target_result(
     matched: list[dict[str, Any]],
     target_id_list: list[int],
     group_index: int,
-    target_offsets: dict[int, np.ndarray] | None,
 ) -> dict[str, Any]:
-    offsets = target_offsets or {}
-    camera_centers = [np.asarray(result["center_in_camera_m"], dtype=np.float64) for result in matched]
-    visible_marker_centers = {
-        int(result["id"]): np.asarray(result["center_in_target_m"], dtype=np.float64).reshape(3)
-        for result in matched
-    }
     visible_ids = [int(result["id"]) for result in matched]
-    known_offset_ids = [target_id for target_id in target_id_list if target_id in offsets]
-    can_complete_group = len(known_offset_ids) == len(target_id_list) and any(target_id in offsets for target_id in visible_ids)
-    inferred_ids: list[int] = []
-    completed_marker_centers: dict[int, np.ndarray] = dict(visible_marker_centers)
-
-    if can_complete_group:
-        center_estimates = [
-            visible_marker_centers[target_id] + offsets[target_id]
-            for target_id in visible_ids
-            if target_id in offsets
-        ]
-        target_center = np.mean(np.stack(center_estimates, axis=0), axis=0)
-        for target_id in target_id_list:
-            if target_id not in completed_marker_centers:
-                completed_marker_centers[target_id] = target_center - offsets[target_id]
-                inferred_ids.append(int(target_id))
-    else:
-        target_centers = [
-            visible_marker_centers[target_id] + offsets.get(target_id, np.zeros(3, dtype=np.float64))
-            for target_id in visible_ids
-        ]
-        target_center = np.mean(np.stack(target_centers, axis=0), axis=0)
+    camera_centers = [np.asarray(result["center_in_camera_m"], dtype=np.float64) for result in matched]
+    # Simple geometric center: average 3D positions of all visible markers
+    visible_positions = [
+        np.asarray(result["center_in_target_m"], dtype=np.float64).reshape(3)
+        for result in matched
+    ]
+    target_center = np.mean(np.stack(visible_positions, axis=0), axis=0)
 
     projected_centers = [np.asarray(result["center_projected_px"], dtype=np.float64) for result in matched]
-    corners_list = [np.asarray(result["corners"], dtype=np.float64) for result in matched]
-    corner_points = np.concatenate(corners_list, axis=0)
+    # Per-marker quadrilateral corners (each 4×2 pixels)
+    marker_corners = [np.asarray(result["corners"], dtype=np.float64).reshape(4, 2) for result in matched]
+    corner_points = np.concatenate(marker_corners, axis=0)
     min_corner = corner_points.min(axis=0)
     max_corner = corner_points.max(axis=0)
     combined_corners = np.array(
@@ -340,16 +220,13 @@ def _build_target_result(
         "target_ids": target_id_list,
         "target_group_index": group_index,
         "visible_ids": visible_ids,
-        "inferred_ids": inferred_ids,
+        "inferred_ids": [],
         "corners": combined_corners,
+        "marker_corners": marker_corners,
         "center_in_camera_m": np.mean(np.stack(camera_centers, axis=0), axis=0),
         "center_in_target_m": target_center,
         "center_projected_px": np.mean(np.stack(projected_centers, axis=0), axis=0),
-        "completed_marker_centers_in_target_m": {
-            str(target_id): completed_marker_centers[target_id]
-            for target_id in sorted(completed_marker_centers)
-        },
-        "offsets_applied": bool(can_complete_group),
+        "offsets_applied": False,
     }
 
 
@@ -363,8 +240,8 @@ def _target_selection_key(target: dict[str, Any]) -> tuple[float, float, float]:
     return (float(len(visible_ids)), coverage, area_px)
 
 
-def select_target(results: list[dict[str, Any]], target_ids: int | list[int] | list[list[int]], target_offsets: dict[int, np.ndarray] | None = None) -> dict[str, Any] | None:
-    candidates = select_targets(results, target_ids, target_offsets)
+def select_target(results: list[dict[str, Any]], target_ids: int | list[int] | list[list[int]]) -> dict[str, Any] | None:
+    candidates = select_targets(results, target_ids)
     if not candidates:
         return None
     return max(candidates, key=_target_selection_key)
@@ -372,7 +249,6 @@ def select_target(results: list[dict[str, Any]], target_ids: int | list[int] | l
 def select_targets(
     results: list[dict[str, Any]],
     target_ids: int | list[int] | list[list[int]],
-    target_offsets: dict[int, np.ndarray] | None = None,
 ) -> list[dict[str, Any]]:
     target_groups = _normalize_target_groups(target_ids)
     candidates: list[dict[str, Any]] = []
@@ -381,7 +257,7 @@ def select_targets(
         matched = [result for result in results if int(result["id"]) in target_id_set]
         if not matched:
             continue
-        candidates.append(_build_target_result(matched, target_id_list, group_index, target_offsets))
+        candidates.append(_build_target_result(matched, target_id_list, group_index))
     return candidates
 
 
@@ -473,7 +349,6 @@ def main() -> None:
     logging_cfg = config.get("logging", {})
     display_cfg = config.get("display", {})
     target_id_groups = get_target_id_groups(tracking_cfg)
-    target_offsets = get_target_offsets(tracking_cfg, get_target_ids(tracking_cfg))
     target_label = target_ids_label(target_id_groups)
     tracker = TargetTracker(
         history_size=int(tracking_cfg.get("history_size", 10)),
@@ -503,7 +378,7 @@ def main() -> None:
         timestamp = first_timestamp
         while True:
             results = detect_markers(frame, context)
-            target = select_target(results, target_id_groups, target_offsets)
+            target = select_target(results, target_id_groups)
             visible_ids = [] if target is None else list(target.get("visible_ids", []))
             selected_target_ids = [] if target is None else list(target.get("target_ids", []))
 

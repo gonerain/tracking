@@ -5,6 +5,7 @@ import bisect
 import json
 import math
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,10 +35,8 @@ from core.lidar_tracking import (
 )
 from core.tracking import (
     draw_tracking_overlay,
-    estimate_target_offsets_from_results,
     get_target_id_groups,
     get_target_ids,
-    get_target_offsets,
     select_targets,
     target_ids_label,
 )
@@ -272,6 +271,177 @@ class TargetWorldWriter:
         if payload:
             payload += "\n"
         self.output_path.write_text(payload, encoding="utf-8")
+
+
+def _reject_trajectory_spikes(
+    records: list[dict[str, Any]],
+    max_speed_mps: float = 5.0,
+) -> None:
+    """Remove single-frame bounce-back spikes from per-group trajectories.
+
+    A spike is a frame where the position jumps far from both the previous and
+    next observations (speed > max_speed_mps in both directions).  The offending
+    aruco_group_target entry is removed from that frame's record.
+    Modifies *records* in place.
+    """
+    # Collect all group indices
+    all_gidxs: set[int] = set()
+    for rec in records:
+        for gt in rec.get("aruco_group_targets", []):
+            gidx = gt.get("target_group_index")
+            if gidx is not None:
+                all_gidxs.add(int(gidx))
+
+    for gidx in all_gidxs:
+        # Build observation list: (record_index, index_within_group_targets, enu)
+        obs: list[tuple[int, int, np.ndarray]] = []
+        for ridx, rec in enumerate(records):
+            for gtidx, gt in enumerate(rec.get("aruco_group_targets", [])):
+                if int(gt.get("target_group_index", -1)) == gidx and not gt.get("interpolated", False):
+                    enu = gt.get("target_world_enu_m")
+                    if enu is not None:
+                        obs.append((ridx, gtidx, np.asarray(enu, dtype=np.float64)))
+                    break
+
+        if len(obs) < 3:
+            continue
+
+        # Identify spike frames (high speed to both prev and next)
+        to_remove: list[tuple[int, int]] = []  # (record_idx, gt_idx)
+        for i in range(1, len(obs) - 1):
+            ridx_prev, _, enu_prev = obs[i - 1]
+            ridx_cur, gtidx_cur, enu_cur = obs[i]
+            ridx_next, _, enu_next = obs[i + 1]
+
+            ts_prev = float(records[ridx_prev]["timestamp"])
+            ts_cur = float(records[ridx_cur]["timestamp"])
+            ts_next = float(records[ridx_next]["timestamp"])
+
+            dt_prev = ts_cur - ts_prev
+            dt_next = ts_next - ts_cur
+            if dt_prev <= 0 or dt_next <= 0:
+                continue
+
+            speed_from_prev = float(np.linalg.norm(enu_cur[:2] - enu_prev[:2])) / dt_prev
+            speed_to_next = float(np.linalg.norm(enu_next[:2] - enu_cur[:2])) / dt_next
+
+            if speed_from_prev > max_speed_mps and speed_to_next > max_speed_mps:
+                to_remove.append((ridx_cur, gtidx_cur))
+
+        # Remove spike entries (iterate in reverse to preserve indices)
+        for ridx, gtidx in reversed(to_remove):
+            gt_list = records[ridx].get("aruco_group_targets", [])
+            if gtidx < len(gt_list):
+                gt_list.pop(gtidx)
+
+
+def _interpolate_missing_group_targets(
+    records: list[dict[str, Any]],
+    max_gap_s: float,
+    ecef_origin: np.ndarray | None,
+    enu_from_ecef: np.ndarray | None,
+) -> list[str]:
+    """Post-process world records: fill gaps in per-group trajectories by linear interpolation.
+
+    For each group, finds frames where the group has no observation and the gap
+    to both the previous and next observation is within max_gap_s.  Inserts a
+    linearly interpolated aruco_group_target entry (marked interpolated=True).
+    Modifies *records* in place.
+
+    Returns a list of warning strings for gaps that exceed max_gap_s.
+    """
+    warnings: list[str] = []
+
+    if ecef_origin is None or enu_from_ecef is None:
+        return warnings
+
+    # Collect all known group indices
+    all_gidxs: set[int] = set()
+    for rec in records:
+        for gt in rec.get("aruco_group_targets", []):
+            gidx = gt.get("target_group_index")
+            if gidx is not None:
+                all_gidxs.add(int(gidx))
+
+    if not all_gidxs:
+        return warnings
+
+    # For each group, build index of observed frames: frame_idx → enu position
+    for gidx in sorted(all_gidxs):
+        observed: list[tuple[int, float, np.ndarray]] = []  # (frame_idx, timestamp, enu)
+        for fidx, rec in enumerate(records):
+            ts = rec.get("timestamp")
+            if ts is None:
+                continue
+            for gt in rec.get("aruco_group_targets", []):
+                if int(gt.get("target_group_index", -1)) == gidx and not gt.get("interpolated", False):
+                    enu = gt.get("target_world_enu_m")
+                    if enu is not None:
+                        observed.append((fidx, float(ts), np.asarray(enu, dtype=np.float64)))
+                    break
+
+        if len(observed) < 2:
+            continue
+
+        # Walk through consecutive observation pairs and fill gaps
+        for oi in range(len(observed) - 1):
+            fidx_a, ts_a, enu_a = observed[oi]
+            fidx_b, ts_b, enu_b = observed[oi + 1]
+
+            if fidx_b - fidx_a <= 1:
+                continue  # no gap
+
+            gap_s = ts_b - ts_a
+            if gap_s <= 0:
+                continue
+
+            if gap_s > max_gap_s:
+                warnings.append(
+                    f"WARNING: group {gidx} ArUco gap {gap_s:.2f}s > {max_gap_s:.1f}s "
+                    f"(ts {ts_a:.3f} → {ts_b:.3f}, frames {fidx_a}→{fidx_b}): "
+                    f"no interpolation applied."
+                )
+                continue
+
+            # Fill each frame between fidx_a and fidx_b
+            for fidx in range(fidx_a + 1, fidx_b):
+                rec = records[fidx]
+                rec_ts = rec.get("timestamp")
+                if rec_ts is None:
+                    continue
+                rec_ts = float(rec_ts)
+                # Already has this group?
+                already = any(
+                    int(gt.get("target_group_index", -1)) == gidx
+                    for gt in rec.get("aruco_group_targets", [])
+                )
+                if already:
+                    continue
+
+                # Linear interpolation in ENU
+                alpha = (rec_ts - ts_a) / (ts_b - ts_a)
+                interp_enu = enu_a + alpha * (enu_b - enu_a)
+                interp_ecef = ecef_origin + enu_from_ecef.T @ interp_enu
+                interp_lat, interp_lon, interp_h = _ecef_to_geodetic(interp_ecef)
+                rec.setdefault("aruco_group_targets", []).append(
+                    {
+                        "target_group_index": gidx,
+                        "target_ids": [],
+                        "visible_ids": [],
+                        "inferred_ids": [],
+                        "offsets_applied": False,
+                        "interpolated": True,
+                        "target_lidar_m": None,
+                        "target_world_lla": [
+                            round(float(interp_lat), 9),
+                            round(float(interp_lon), 9),
+                            round(float(interp_h), 6),
+                        ],
+                        "target_world_enu_m": np.round(interp_enu, 6).tolist(),
+                    }
+                )
+
+    return warnings
 
 
 def _dms_to_deg(deg_token: str, minute_token: str, second_token: str) -> float:
@@ -608,12 +778,6 @@ class ArucoPriorProvider:
         tracking_cfg = config.get("tracking", {})
         self.target_id_groups = get_target_id_groups(tracking_cfg)
         self.target_ids = get_target_ids(tracking_cfg)
-        auto_offsets_cfg = dict(tracking_cfg.get("auto_target_offsets", {}))
-        self.auto_target_offsets_enabled = bool(auto_offsets_cfg.get("enabled", True))
-        self.auto_target_offsets_min_visible = int(auto_offsets_cfg.get("min_visible_markers", 3))
-        self.auto_target_offsets_by_group = bool(auto_offsets_cfg.get("once_per_group", True))
-        self.calibrated_group_indices: set[int] = set()
-        self.target_offsets = {} if self.auto_target_offsets_enabled else get_target_offsets(tracking_cfg, self.target_ids)
         self.target_label = target_ids_label(self.target_id_groups)
         self.latest_timestamp: float | None = None
         self.pending_frame: tuple[np.ndarray, float] | None = None
@@ -650,23 +814,7 @@ class ArucoPriorProvider:
             self.latest_frame = frame.copy()
             results = detect_markers(frame, self.context)
             self.latest_results = results
-            if self.auto_target_offsets_enabled:
-                candidate_groups = [
-                    target_group
-                    for group_index, target_group in enumerate(self.target_id_groups)
-                    if not self.auto_target_offsets_by_group or group_index not in self.calibrated_group_indices
-                ]
-                learned_offsets = estimate_target_offsets_from_results(
-                    results,
-                    candidate_groups,
-                    min_visible_markers=self.auto_target_offsets_min_visible,
-                )
-                if learned_offsets:
-                    self.target_offsets.update(learned_offsets)
-                    for group_index, target_group in enumerate(self.target_id_groups):
-                        if all(target_id in learned_offsets for target_id in target_group):
-                            self.calibrated_group_indices.add(group_index)
-            target_results = select_targets(results, self.target_id_groups, self.target_offsets)
+            target_results = select_targets(results, self.target_id_groups)
             target = None if not target_results else max(target_results, key=lambda item: (len(item.get("visible_ids", [])), len(item.get("target_ids", []))))
             self.latest_target_result = target
             self.latest_target_results = target_results
@@ -712,7 +860,7 @@ class ArucoPriorProvider:
             tracking_state=self.latest_tracking_state,
             target_result=self.latest_target_result,
             target_results=[dict(item) for item in self.latest_target_results],
-            calibrated_group_indices=sorted(int(index) for index in self.calibrated_group_indices),
+            calibrated_group_indices=[],
         )
 
 
@@ -1042,6 +1190,25 @@ def parse_args() -> argparse.Namespace:
         default="outputs/target_world_positions.jsonl",
         help="Path to per-frame world target position JSONL output.",
     )
+    parser.add_argument(
+        "--debug-ts-start",
+        type=float,
+        default=None,
+        help="Save debug images for every frame with timestamp >= this value.",
+    )
+    parser.add_argument(
+        "--debug-ts-end",
+        type=float,
+        default=None,
+        help="Save debug images for every frame with timestamp <= this value.",
+    )
+    parser.add_argument(
+        "--dump-lidar-ts",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Dump LiDAR ROI point depths to txt at these timestamps (±0.05s tolerance).",
+    )
     return parser.parse_args()
 
 
@@ -1293,105 +1460,144 @@ def _project_lidar_points_to_image(
     return pixels_xy, front_mask, valid_mask
 
 
-def select_points_in_aruco_roi(
+def select_points_in_aruco_roi_per_group(
     points: np.ndarray,
     aruco_target_results: list[dict[str, Any]],
     aruco_context: Any,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Filter LiDAR points by projecting into the ArUco marker image region.
+    outlier_std_thresh: float = 2.0,
+    dump_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Filter LiDAR points per ArUco group using the convex hull of all marker corners.
 
-    Args:
-        points: (N, 3) LiDAR point cloud.
-        aruco_target_results: list of ArUco detection dicts, each with 'corners' (4×2 px).
-        aruco_context: CameraProjectionContext with camera intrinsics and extrinsics.
+    The convex hull of all visible marker corners approximates the marker board
+    boundary.  LiDAR points projected inside this hull are kept, then statistical
+    outlier rejection removes points whose 3-D distance from the median exceeds
+    outlier_std_thresh standard deviations.
 
-    Returns:
-        (filtered_points, aruco_depth_m):
-          - filtered_points: points whose projection falls inside the ArUco bbox.
-          - aruco_depth_m: estimated depth of ArUco center in camera frame.
+    Returns a list of dicts, one per group, each with:
+      - 'target': the original target result dict
+      - 'points': (M, 3) inlier LiDAR points inside the board hull
+      - 'aruco_center_lidar': (3,) ArUco center in LiDAR frame
     """
     if points.size == 0 or not aruco_target_results:
-        return np.empty((0, 3), dtype=np.float64), np.nan
+        return []
 
-    # Compute tight bounding box from all visible marker corners
-    all_corners = np.concatenate(
-        [np.asarray(r["corners"], dtype=np.float64).reshape(-1, 2) for r in aruco_target_results],
-        axis=0,
-    )
-    bbox_min = all_corners.min(axis=0)  # (x_min, y_min)
-    bbox_max = all_corners.max(axis=0)  # (x_max, y_max)
-
-    # ArUco depth: mean z of marker centers in camera frame
-    R = np.asarray(aruco_context.rotation_target_from_camera, dtype=np.float64)
-    t = np.asarray(aruco_context.translation_target_from_camera, dtype=np.float64)
-    aruco_depths = []
-    for r in aruco_target_results:
-        center_lidar = np.asarray(r["center_in_target_m"], dtype=np.float64)
-        center_camera = R.T @ (center_lidar - t)
-        aruco_depths.append(float(center_camera[2]))
-    aruco_depth_m = float(np.mean(aruco_depths))
-
-    # Vectorized projection
+    # Project all points once (shared across groups)
     pixels_xy, _, valid_mask = _project_lidar_points_to_image(points, aruco_context)
 
-    # Filter by bounding box
-    in_bbox = (
-        valid_mask
-        & (pixels_xy[:, 0] >= bbox_min[0])
-        & (pixels_xy[:, 0] <= bbox_max[0])
-        & (pixels_xy[:, 1] >= bbox_min[1])
-        & (pixels_xy[:, 1] <= bbox_max[1])
-    )
+    # Image dimensions — derived from camera matrix principal point
+    cx = float(aruco_context.camera_matrix[0, 2])
+    cy = float(aruco_context.camera_matrix[1, 2])
+    img_w = int(cx * 2 + 1)
+    img_h = int(cy * 2 + 1)
 
-    return points[in_bbox], aruco_depth_m
+    px = pixels_xy[:, 0].astype(np.int32)
+    py = pixels_xy[:, 1].astype(np.int32)
+    in_bounds = valid_mask & (px >= 0) & (px < img_w) & (py >= 0) & (py < img_h)
 
+    # Dump projection stats header
+    if dump_path:
+        with open(dump_path, "a") as df:
+            df.write(f"=== LiDAR projection stats ===\n")
+            df.write(f"total_input_points:       {len(points)}\n")
+            df.write(f"valid_projection (z>0):   {int(valid_mask.sum())}\n")
+            df.write(f"in_image_bounds:          {int(in_bounds.sum())}\n")
+            df.write(f"image_size:               {img_w}x{img_h}\n\n")
 
-def cluster_aruco_roi_points(
-    points: np.ndarray,
-    aruco_depth_m: float,
-    tolerance_m: float = 0.45,
-    min_cluster_points: int = 3,
-    max_cluster_points: int = 5000,
-) -> np.ndarray:
-    """Cluster points from ArUco ROI and return centroid of best cluster.
+    group_results: list[dict[str, Any]] = []
+    for target in aruco_target_results:
+        marker_corners_list = target.get("marker_corners", [])
+        if not marker_corners_list:
+            continue
 
-    Runs euclidean clustering, then selects the largest cluster whose centroid
-    is closest to the ArUco depth.
+        # Collect all corner points from every visible marker in this group
+        all_corners = np.concatenate(
+            [np.asarray(mc, dtype=np.float32).reshape(-1, 2) for mc in marker_corners_list],
+            axis=0,
+        )  # shape (4*N, 2)
 
-    Returns:
-        centroid (3,) of the selected cluster, or empty array if no valid cluster.
-    """
-    if points.size == 0:
-        return np.empty((0,), dtype=np.float64)
+        # Convex hull of all marker corners → approximates the board boundary
+        hull = cv2.convexHull(all_corners.reshape(-1, 1, 2).astype(np.int32))
 
-    clusters = euclidean_clusters(
-        points=points,
-        tolerance=tolerance_m,
-        min_points=min_cluster_points,
-        max_points=max_cluster_points,
-    )
+        # Fill hull into mask
+        mask = np.zeros((img_h, img_w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, hull, 255)
 
-    if not clusters:
-        return np.empty((0,), dtype=np.float64)
+        # Select LiDAR points whose projection falls inside the hull
+        in_hull = np.zeros(len(points), dtype=bool)
+        idx = np.where(in_bounds)[0]
+        in_hull[idx] = mask[py[idx], px[idx]] > 0
+        roi_pts = points[in_hull]
 
-    # Score clusters: prefer largest cluster closest to ArUco depth
-    best_cluster = None
-    best_score = -math.inf
-    for cluster in clusters:
-        centroid = np.mean(cluster, axis=0)
-        # Distance from cluster centroid to ArUco center in LiDAR frame
-        point_count = cluster.shape[0]
-        # Larger clusters score higher, penalize distance to ArUco depth
-        # (depth comparison not directly available in LiDAR frame, use 3D distance)
-        score = point_count
-        if best_cluster is None or score > best_score:
-            best_score = score
-            best_cluster = cluster
+        if dump_path:
+            hull_area = cv2.contourArea(hull)
+            visible_ids = target.get("visible_ids", [])
+            gidx_label = target.get("target_group_index", "?")
+            # Hull bounding box
+            hx = hull.reshape(-1, 2)[:, 0]
+            hy = hull.reshape(-1, 2)[:, 1]
+            hx_min, hx_max = int(hx.min()), int(hx.max())
+            hy_min, hy_max = int(hy.min()), int(hy.max())
+            # Expand region by 50px to see nearby LiDAR points
+            pad = 50
+            rx_min = max(0, hx_min - pad)
+            rx_max = min(img_w - 1, hx_max + pad)
+            ry_min = max(0, hy_min - pad)
+            ry_max = min(img_h - 1, hy_max + pad)
+            nearby = in_bounds & (px >= rx_min) & (px <= rx_max) & (py >= ry_min) & (py <= ry_max)
+            nearby_idx = np.where(nearby)[0]
+            with open(dump_path, "a") as df:
+                df.write(f"--- group_{gidx_label} ---\n")
+                df.write(f"visible_markers:          {len(visible_ids)}  ids={visible_ids}\n")
+                df.write(f"hull_area_px:             {hull_area:.1f}\n")
+                df.write(f"hull_vertices:            {hull.reshape(-1, 2).tolist()}\n")
+                df.write(f"hull_bbox:                x=[{hx_min},{hx_max}] y=[{hy_min},{hy_max}]\n")
+                df.write(f"points_in_hull:           {int(in_hull.sum())}\n")
+                df.write(f"\nNearby LiDAR points (hull ± {pad}px):  {len(nearby_idx)}\n")
+                df.write(f"{'idx':>5}  {'px_x':>6}  {'px_y':>6}  {'in_hull':>7}  {'x':>10}  {'y':>10}  {'z':>10}  {'depth':>10}\n")
+                for ni in nearby_idx:
+                    x, y, z = points[ni]
+                    depth = np.sqrt(x * x + y * y + z * z)
+                    ih = "YES" if in_hull[ni] else ""
+                    df.write(f"{ni:5d}  {px[ni]:6d}  {py[ni]:6d}  {ih:>7}  {x:10.4f}  {y:10.4f}  {z:10.4f}  {depth:10.4f}\n")
+                df.write(f"\n")
 
-    if best_cluster is None:
-        return np.empty((0,), dtype=np.float64)
+        # Statistical outlier rejection: remove points > outlier_std_thresh σ
+        # from the median 3-D position (robust to a few far-off background hits)
+        raw_roi_pts = roi_pts.copy()
+        outlier_mask = np.ones(len(roi_pts), dtype=bool)
+        if roi_pts.shape[0] >= 4:
+            median = np.median(roi_pts, axis=0)
+            dists = np.linalg.norm(roi_pts - median, axis=1)
+            std = dists.std()
+            if std > 0:
+                outlier_mask = dists <= outlier_std_thresh * std
+                roi_pts = roi_pts[outlier_mask]
 
-    return np.mean(best_cluster, axis=0)
+        # Dump LiDAR ROI points to text file for debugging
+        if dump_path and raw_roi_pts.shape[0] > 0:
+            gidx_label = target.get("target_group_index", "?")
+            with open(dump_path, "a") as df:
+                df.write(f"--- group_{gidx_label} | {raw_roi_pts.shape[0]} raw, {roi_pts.shape[0]} after outlier rejection ---\n")
+                df.write(f"{'idx':>4}  {'x':>10}  {'y':>10}  {'z':>10}  {'depth':>10}  {'kept':>5}\n")
+                for pi in range(raw_roi_pts.shape[0]):
+                    x, y, z = raw_roi_pts[pi]
+                    depth = np.sqrt(x * x + y * y + z * z)
+                    kept = "yes" if outlier_mask[pi] else "NO"
+                    df.write(f"{pi:4d}  {x:10.4f}  {y:10.4f}  {z:10.4f}  {depth:10.4f}  {kept:>5}\n")
+                if roi_pts.shape[0] > 0:
+                    centroid = np.mean(roi_pts, axis=0)
+                    df.write(f"centroid(inlier): x={centroid[0]:.4f} y={centroid[1]:.4f} z={centroid[2]:.4f} depth={np.linalg.norm(centroid):.4f}\n")
+                df.write("\n")
+
+        aruco_center = np.asarray(target["center_in_target_m"], dtype=np.float64)
+        group_results.append({
+            "target": target,
+            "points": roi_pts,
+            "aruco_center_lidar": aruco_center,
+        })
+
+    return group_results
 
 
 def apply_aruco_local_roi(
@@ -1590,8 +1796,25 @@ def main() -> None:
 
     frame_index = 0
     interrupted = False
-    local_roi_recovery_countdown = 0
-    previous_track_positions: list[np.ndarray] = []
+    interp_warning_log = Path(str(args.output_json)).parent / "interpolation_warnings.log"
+
+    interp_max_gap_s = float(tracker_cfg.get("max_interpolation_gap_s", 2.0))
+
+    # ArUco debug images: save every frame where detection fails
+    aruco_debug_fail_dir = Path(str(args.output_json)).parent / "aruco_debug" / "failures"
+    aruco_debug_fail_dir.mkdir(parents=True, exist_ok=True)
+
+    # Timestamp-range debug images: save every frame within [debug_ts_start, debug_ts_end]
+    debug_ts_start: float | None = args.debug_ts_start
+    debug_ts_end: float | None = args.debug_ts_end
+    aruco_debug_range_dir = Path(str(args.output_json)).parent / "aruco_debug" / "ts_range"
+    if debug_ts_start is not None or debug_ts_end is not None:
+        aruco_debug_range_dir.mkdir(parents=True, exist_ok=True)
+
+    dump_lidar_ts_set: set[float] = set(args.dump_lidar_ts) if args.dump_lidar_ts else set()
+    dump_lidar_dir = Path(str(args.output_json)).parent / "lidar_dump"
+    if dump_lidar_ts_set:
+        dump_lidar_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         while True:
@@ -1609,82 +1832,76 @@ def main() -> None:
             aruco_debug = aruco_provider.get_debug_state()
 
             # --- ArUco 2D ROI path: when ArUco markers are visible, use their
-            #     image region to cut LiDAR points directly, then cluster to
-            #     reject outliers.  Falls back to the original pipeline when
-            #     ArUco is not detected. ---
+            #     image region to cut LiDAR points directly.
+            #     A group is only considered valid if it has >= 2 visible markers.
+            #     Falls back to interpolation in post-processing when not detected. ---
             aruco_2d_roi_used = False
-            aruco_roi_centroid: np.ndarray | None = None
+            # Mapping: target_group_index → LiDAR-clustered centroid (used for world output)
+            group_lidar_centroids: dict[int, np.ndarray] = {}
 
-            if aruco_debug.target_results:
-                aruco_roi_points, aruco_depth = select_points_in_aruco_roi(
+            # Only accept groups with at least 2 visible sub-markers
+            valid_aruco_targets = [
+                t for t in aruco_debug.target_results
+                if len(t.get("visible_ids", [])) >= 2
+            ]
+
+            if valid_aruco_targets:
+                # Check if we should dump LiDAR points at this timestamp
+                _dump_path = None
+                if dump_lidar_ts_set:
+                    for dts in dump_lidar_ts_set:
+                        if abs(timestamp - dts) < 0.05:
+                            _dump_path = str(dump_lidar_dir / f"lidar_roi_{timestamp:.3f}.txt")
+                            with open(_dump_path, "w") as df:
+                                df.write(f"timestamp:                {timestamp:.6f}\n")
+                                df.write(f"frame_index:              {frame_index}\n")
+                                df.write(f"raw_lidar_points:         {raw_count}\n")
+                                df.write(f"after_roi_crop:           {point_count_after_roi}\n")
+                                df.write(f"after_ego_filter:         {point_count_after_ego_filter}\n\n")
+                            break
+                per_group = select_points_in_aruco_roi_per_group(
                     points=no_ego_points,
-                    aruco_target_results=aruco_debug.target_results,
+                    aruco_target_results=valid_aruco_targets,
                     aruco_context=aruco_provider.context,
+                    dump_path=_dump_path,
                 )
-                if aruco_roi_points.shape[0] > 0:
-                    aruco_roi_centroid = cluster_aruco_roi_points(
-                        points=aruco_roi_points,
-                        aruco_depth_m=aruco_depth,
-                        tolerance_m=float(clustering_cfg["tolerance_m"]),
-                        min_cluster_points=int(clustering_cfg.get("min_cluster_points", 3)),
-                        max_cluster_points=int(clustering_cfg.get("max_cluster_points", 5000)),
-                    )
-                    if aruco_roi_centroid.size > 0:
-                        aruco_2d_roi_used = True
+                aruco_candidates: list[ClusterCandidate] = []
+                total_roi_points = 0
+                for gidx, group in enumerate(per_group):
+                    grp_points = group["points"]
+                    if grp_points.shape[0] == 0:
+                        continue
+                    # Mean of all LiDAR points inside the ArUco ROI
+                    centroid = np.mean(grp_points, axis=0)
+                    total_roi_points += int(grp_points.shape[0])
+                    target = group["target"]
+                    group_idx = int(target.get("target_group_index", -1))
+                    group_lidar_centroids[group_idx] = centroid
+                    aruco_candidates.append(ClusterCandidate(
+                        cluster_id=gidx,
+                        point_count=int(grp_points.shape[0]),
+                        centroid=centroid,
+                        footpoint=centroid.copy(),
+                        size=np.zeros(3, dtype=np.float64),
+                        min_bound=grp_points.min(axis=0),
+                        max_bound=grp_points.max(axis=0),
+                        score=1.0,
+                    ))
+                if aruco_candidates:
+                    aruco_2d_roi_used = True
 
             if aruco_2d_roi_used:
-                # Build a synthetic candidate from the ArUco 2D ROI cluster
                 processed = no_ego_points
                 point_count_after_ground_removal = point_count_after_ego_filter
-                point_count_after_aruco_local_roi = int(aruco_roi_points.shape[0])
-                synthetic_candidate = ClusterCandidate(
-                    cluster_id=0,
-                    point_count=int(aruco_roi_points.shape[0]),
-                    centroid=aruco_roi_centroid,
-                    footpoint=aruco_roi_centroid.copy(),
-                    size=np.zeros(3, dtype=np.float64),
-                    min_bound=aruco_roi_points.min(axis=0),
-                    max_bound=aruco_roi_points.max(axis=0),
-                    score=1.0,
-                )
-                candidates = [synthetic_candidate]
+                point_count_after_aruco_local_roi = total_roi_points
+                candidates = aruco_candidates
             else:
-                # Fallback: original pipeline (ground removal + local ROI + clustering)
-                ground_cfg = dict(lidar_config.get("ground_removal", {}))
-                protect_regions = build_ground_protect_regions(previous_track_positions, aruco_priors, ground_cfg)
-                if protect_regions:
-                    ground_cfg["protect_regions"] = protect_regions
-                processed = remove_ground(no_ego_points, ground_cfg)
-                point_count_after_ground_removal = int(processed.shape[0])
-                use_local_roi = local_roi_recovery_countdown <= 0
-                aruco_target_centers = [
-                    np.asarray(target["center_in_target_m"], dtype=np.float64)
-                    for target in aruco_debug.target_results
-                    if "center_in_target_m" in target
-                ]
-                processed = apply_aruco_local_roi(
-                    processed,
-                    aruco_prior,
-                    aruco_target_centers,
-                    lidar_config.get("roi", {}),
-                    reconnect_streak=0,
-                    force_disable=not use_local_roi,
-                )
-                point_count_after_aruco_local_roi = int(processed.shape[0])
-
-                fallback_clusters = euclidean_clusters(
-                    points=processed,
-                    tolerance=float(clustering_cfg["tolerance_m"]),
-                    min_points=int(clustering_cfg["min_cluster_points"]),
-                    max_points=int(clustering_cfg["max_cluster_points"]),
-                ) if processed.shape[0] > 0 else []
-                fallback_clusters = merge_vertical_person_clusters(
-                    fallback_clusters,
-                    xy_merge_distance_m=float(clustering_cfg.get("merge_xy_distance_m", 0.55)),
-                    z_gap_m=float(clustering_cfg.get("merge_z_gap_m", 0.9)),
-                    max_merged_points=int(clustering_cfg.get("merge_max_points", 8000)),
-                ) if fallback_clusters else []
-                candidates = build_target_mask_v2_candidates(fallback_clusters, lidar_config["person_cluster"])
+                # No ArUco detection: skip LiDAR pipeline entirely.
+                # Position will be filled by post-processing linear interpolation.
+                processed = no_ego_points
+                point_count_after_ground_removal = point_count_after_ego_filter
+                point_count_after_aruco_local_roi = point_count_after_ego_filter
+                candidates = []
 
             aruco_selected_candidate = None
             tracker_candidates = list(candidates)
@@ -1711,17 +1928,7 @@ def main() -> None:
             state = None
             used_aruco_fallback = False
 
-            if aruco_priors and int(len(tracker_candidates)) == 0:
-                local_cfg = lidar_config.get("roi", {}).get("local_with_aruco", {})
-                trigger_after = int(local_cfg.get("recovery_trigger_frames", 2))
-                recovery_frames = int(local_cfg.get("recovery_disable_frames", 4))
-                if trigger_after <= 0:
-                    local_roi_recovery_countdown = max(local_roi_recovery_countdown, recovery_frames)
-            if local_roi_recovery_countdown > 0:
-                local_roi_recovery_countdown -= 1
-
             multi_tracks = multi_tracker.update(timestamp=timestamp, candidates=candidates)
-            previous_track_positions = [track.state.position.copy() for track in multi_tracks]
 
             debug_writer.write(
                 frame_index=frame_index,
@@ -1793,10 +2000,15 @@ def main() -> None:
                     "heading_deg": round(float(ie_pose.heading_deg), 6),
                 }
                 if ecef_origin is not None and enu_from_ecef is not None:
-                    for target in aruco_debug.target_results:
+                    for target in valid_aruco_targets:
                         if "center_in_target_m" not in target:
                             continue
-                        aruco_lidar = np.asarray(target["center_in_target_m"], dtype=np.float64).reshape(3)
+                        tgt_gidx = int(target.get("target_group_index", -1))
+                        # Prefer LiDAR-clustered centroid over raw ArUco detection
+                        if tgt_gidx in group_lidar_centroids:
+                            aruco_lidar = group_lidar_centroids[tgt_gidx]
+                        else:
+                            aruco_lidar = np.asarray(target["center_in_target_m"], dtype=np.float64).reshape(3)
                         aruco_body = lidar_to_ie_body(aruco_lidar)
                         aruco_offset_enu = rot_enu_from_body @ aruco_body
                         aruco_ecef = lidar_ecef + (enu_to_ecef @ aruco_offset_enu)
@@ -1809,6 +2021,8 @@ def main() -> None:
                                 "visible_ids": list(target.get("visible_ids", [])),
                                 "inferred_ids": list(target.get("inferred_ids", [])),
                                 "offsets_applied": bool(target.get("offsets_applied", False)),
+                                "interpolated": False,
+                                "corners_px": np.round(np.asarray(target["corners"], dtype=np.float64), 1).tolist(),
                                 "target_lidar_m": np.round(aruco_lidar, 6).tolist(),
                                 "target_world_lla": [
                                     round(float(aruco_lat), 9),
@@ -1877,6 +2091,67 @@ def main() -> None:
             else:
                 print(json.dumps(record, ensure_ascii=False))
 
+            # Save every frame where the camera sees no ArUco markers at all
+            if not aruco_debug.results and aruco_debug.frame is not None:
+                vis = draw_results(aruco_debug.frame.copy(), aruco_debug.results, aruco_provider.context)
+                for target in aruco_debug.target_results:
+                    for mc in target.get("marker_corners", []):
+                        poly = np.asarray(mc, dtype=np.int32).reshape(-1, 1, 2)
+                        cv2.polylines(vis, [poly], isClosed=True, color=(0, 0, 255), thickness=2)
+                cv2.putText(
+                    vis,
+                    f"NO MARKER t={timestamp:.1f} frame={frame_index}",
+                    (10, vis.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+                )
+                cv2.imwrite(str(aruco_debug_fail_dir / f"fail_{frame_index:06d}_{timestamp:.1f}.png"), vis)
+
+            # Save every frame within the debug timestamp range
+            in_debug_range = (
+                (debug_ts_start is None or timestamp >= debug_ts_start)
+                and (debug_ts_end is None or timestamp <= debug_ts_end)
+                and (debug_ts_start is not None or debug_ts_end is not None)
+            )
+            if in_debug_range and aruco_debug.frame is not None:
+                vis = draw_results(aruco_debug.frame.copy(), aruco_debug.results, aruco_provider.context)
+                # Draw valid group convex hull ROIs
+                for target in valid_aruco_targets:
+                    gidx = int(target.get("target_group_index", -1))
+                    color = (0, 255, 0) if gidx == 0 else (255, 165, 0)
+                    marker_corners_list = target.get("marker_corners", [])
+                    if marker_corners_list:
+                        all_corners = np.concatenate(
+                            [np.asarray(mc, dtype=np.float32).reshape(-1, 2) for mc in marker_corners_list], axis=0
+                        )
+                        hull = cv2.convexHull(all_corners.reshape(-1, 1, 2).astype(np.int32))
+                        cv2.polylines(vis, [hull], isClosed=True, color=color, thickness=2)
+                    vis_ids = target.get("visible_ids", [])
+                    lidar_centroid = group_lidar_centroids.get(gidx)
+                    centroid_str = ""
+                    if lidar_centroid is not None:
+                        centroid_str = f" lidar=[{lidar_centroid[0]:.2f},{lidar_centroid[1]:.2f},{lidar_centroid[2]:.2f}]"
+                    top_y = 30 + gidx * 30
+                    cv2.putText(vis, f"G{gidx} vis={len(vis_ids)}{centroid_str}",
+                                (10, top_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                # Project LiDAR points onto the image as red dots
+                if no_ego_points.shape[0] > 0:
+                    px_xy, _, v_mask = _project_lidar_points_to_image(no_ego_points, aruco_provider.context)
+                    img_h_vis, img_w_vis = vis.shape[:2]
+                    lpx = px_xy[:, 0].astype(np.int32)
+                    lpy = px_xy[:, 1].astype(np.int32)
+                    vis_in_bounds = v_mask & (lpx >= 0) & (lpx < img_w_vis) & (lpy >= 0) & (lpy < img_h_vis)
+                    for pi in np.where(vis_in_bounds)[0]:
+                        cv2.circle(vis, (int(lpx[pi]), int(lpy[pi])), 2, (0, 0, 255), -1)
+
+                status = "OK" if aruco_2d_roi_used else "NO_LIDAR"
+                cv2.putText(
+                    vis,
+                    f"{status} t={timestamp:.3f} frame={frame_index}",
+                    (10, vis.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+                )
+                cv2.imwrite(str(aruco_debug_range_dir / f"dbg_{frame_index:06d}_{timestamp:.3f}.png"), vis)
+
             frame_index += 1
 
     except KeyboardInterrupt:
@@ -1887,7 +2162,22 @@ def main() -> None:
         if json_writer is not None:
             json_writer.flush()
         if write_target_world_json:
+            _reject_trajectory_spikes(
+                target_world_writer.records,
+                max_speed_mps=float(tracker_cfg.get("max_pedestrian_speed_mps", 5.0)),
+            )
+            interp_warnings = _interpolate_missing_group_targets(
+                target_world_writer.records,
+                max_gap_s=interp_max_gap_s,
+                ecef_origin=ecef_origin,
+                enu_from_ecef=enu_from_ecef,
+            )
             target_world_writer.flush()
+            if interp_warnings:
+                with open(interp_warning_log, "w") as _wf:
+                    _wf.write("\n".join(interp_warnings) + "\n")
+                for w in interp_warnings:
+                    print(w, file=sys.stderr)
 
     if interrupted:
         print("Interrupted by user.")
