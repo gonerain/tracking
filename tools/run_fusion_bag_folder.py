@@ -44,17 +44,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--parallel", type=int, default=1, metavar="N", help="Number of bags to process in parallel (default: 1).")
     parser.add_argument("--export-kml", action="store_true", help="Export per-bag and merged KML after JSONL outputs are created.")
     parser.add_argument("--kml-sample-step", type=int, default=500, help="Sample step passed to KML exporter.")
-    parser.add_argument(
-        "--no-auto-calibrate-target-offsets",
-        action="store_true",
-        help="Disable one-time folder scan for ArUco group offsets.",
-    )
-    parser.add_argument(
-        "--auto-offset-scan-frames-per-bag",
-        type=int,
-        default=300,
-        help="Maximum camera frames to scan per bag while estimating ArUco group offsets.",
-    )
     return parser.parse_args()
 
 
@@ -114,55 +103,6 @@ def prepare_configs(
     write_yaml(aruco_path, aruco_runtime)
     write_yaml(lidar_path, lidar_runtime)
     return aruco_path, lidar_path
-
-
-def auto_calibrate_target_offsets(
-    bags: list[Path],
-    aruco_config: dict[str, Any],
-    frames_per_bag: int,
-) -> dict[int, list[float]]:
-    from core.detect_aruco import FrameSource, build_detector_context, detect_markers
-    from core.tracking import estimate_target_offsets_from_results, get_target_id_groups, get_target_ids
-
-    tracking_cfg = dict(aruco_config.get("tracking", {}))
-    target_id_groups = get_target_id_groups(tracking_cfg)
-    target_ids = get_target_ids(tracking_cfg)
-    learned: dict[int, list[float]] = {}
-    if frames_per_bag <= 0:
-        return learned
-
-    for bag_path in bags:
-        runtime_config = json.loads(json.dumps(aruco_config))
-        set_nested(runtime_config, ["input", "rosbag", "bag_path"], str(bag_path))
-        context = build_detector_context(runtime_config)
-        source = FrameSource(runtime_config)
-        try:
-            for _ in range(frames_per_bag):
-                ok, frame, _timestamp = source.read()
-                if not ok or frame is None:
-                    break
-                results = detect_markers(frame, context)
-                offsets = estimate_target_offsets_from_results(results, target_id_groups, min_visible_markers=3)
-                for target_id, offset in offsets.items():
-                    if int(target_id) not in learned:
-                        learned[int(target_id)] = [round(float(value), 6) for value in offset.tolist()]
-                if all(target_id in learned for target_id in target_ids):
-                    return learned
-        finally:
-            source.release()
-    return learned
-
-
-def apply_calibrated_offsets(aruco_config: dict[str, Any], offsets: dict[int, list[float]]) -> None:
-    tracking_cfg = aruco_config.setdefault("tracking", {})
-    tracking_cfg["target_offsets_m"] = {
-        str(target_id): offset
-        for target_id, offset in sorted(offsets.items())
-    }
-    tracking_cfg["auto_target_offsets"] = {
-        "enabled": False,
-        "source": "folder_pre_scan",
-    }
 
 
 def run_command(command: list[str], log_path: Path) -> int:
@@ -342,15 +282,6 @@ def main() -> None:
         gt_path = str(ie_cfg.get("path", ""))
 
     calibrated_offsets: dict[int, list[float]] = {}
-    if not args.no_auto_calibrate_target_offsets:
-        print("auto-calibrating ArUco target offsets from bag folder...")
-        calibrated_offsets = auto_calibrate_target_offsets(
-            bags,
-            aruco_config,
-            frames_per_bag=int(args.auto_offset_scan_frames_per_bag),
-        )
-        apply_calibrated_offsets(aruco_config, calibrated_offsets)
-        print(f"  calibrated_offsets={{{', '.join(f'{k}: {v}' for k, v in sorted(calibrated_offsets.items()))}}}")
 
     per_bag_jsonl: list[tuple[str, Path]] = []
     per_bag_fusion_json: list[tuple[str, Path]] = []

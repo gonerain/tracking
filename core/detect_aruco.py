@@ -433,13 +433,11 @@ def main() -> None:
     window_name = str(display_cfg.get("window_name", "aruco_detection"))
     tracking_cfg = config.get("tracking", {})
     target_id_groups: list[list[int]] = []
-    target_offsets: dict[int, np.ndarray] = {}
     target_label = ""
     if tracking_cfg:
-        from core.tracking import get_target_id_groups, get_target_ids, get_target_offsets, select_target, target_ids_label
+        from core.tracking import get_target_id_groups, select_target, target_ids_label
 
         target_id_groups = get_target_id_groups(tracking_cfg)
-        target_offsets = get_target_offsets(tracking_cfg, get_target_ids(tracking_cfg))
         target_label = target_ids_label(target_id_groups)
 
     if display_enabled:
@@ -459,7 +457,7 @@ def main() -> None:
             results = detect_markers(frame, context)
             selected_target = None
             if target_id_groups:
-                selected_target = select_target(results, target_id_groups, target_offsets)
+                selected_target = select_target(results, target_id_groups)
             for result in results:
                 print(
                     f"marker_id={result['id']} center_in_camera_m={np.round(result['center_in_camera_m'], 4).tolist()} "
