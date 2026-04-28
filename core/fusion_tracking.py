@@ -255,6 +255,14 @@ class IePose:
 
 
 class TargetWorldWriter:
+    CSV_FIELDS = [
+        "utc_seconds",
+        "gt_lat", "gt_lon", "gt_height",
+        "gt_roll", "gt_pitch", "gt_heading",
+        "target_0_lat", "target_0_lon", "target_0_height",
+        "target_1_lat", "target_1_lon", "target_1_height",
+    ]
+
     def __init__(self, output_path: Path, flush_every_frame: bool) -> None:
         self.output_path = output_path
         self.flush_every_frame = bool(flush_every_frame)
@@ -266,11 +274,36 @@ class TargetWorldWriter:
         if self.flush_every_frame:
             self.flush()
 
+    def _record_to_csv_row(self, rec: dict[str, Any]) -> dict[str, Any]:
+        row: dict[str, Any] = {"utc_seconds": round(float(rec.get("timestamp", 0)), 6)}
+        ie_pose = rec.get("ie_pose")
+        if isinstance(ie_pose, dict):
+            row["gt_lat"] = ie_pose.get("latitude_deg")
+            row["gt_lon"] = ie_pose.get("longitude_deg")
+            row["gt_height"] = ie_pose.get("height_m")
+            row["gt_roll"] = ie_pose.get("roll_deg")
+            row["gt_pitch"] = ie_pose.get("pitch_deg")
+            row["gt_heading"] = ie_pose.get("heading_deg")
+        for target in rec.get("aruco_group_targets", []):
+            if not isinstance(target, dict):
+                continue
+            gid = target.get("target_group_index")
+            lla = target.get("target_world_lla")
+            if gid is None or not isinstance(lla, list) or len(lla) < 3:
+                continue
+            prefix = f"target_{int(gid)}"
+            row[f"{prefix}_lat"] = lla[0]
+            row[f"{prefix}_lon"] = lla[1]
+            row[f"{prefix}_height"] = lla[2]
+        return row
+
     def flush(self) -> None:
-        payload = "\n".join(json.dumps(item, ensure_ascii=False) for item in self.records)
-        if payload:
-            payload += "\n"
-        self.output_path.write_text(payload, encoding="utf-8")
+        import csv as _csv
+        with self.output_path.open("w", newline="", encoding="utf-8") as f:
+            writer = _csv.DictWriter(f, fieldnames=self.CSV_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            for rec in self.records:
+                writer.writerow(self._record_to_csv_row(rec))
 
 
 def _reject_trajectory_spikes(
@@ -1187,8 +1220,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-target-world-json",
-        default="outputs/target_world_positions.jsonl",
-        help="Path to per-frame world target position JSONL output.",
+        default="outputs/target_world_positions.csv",
+        help="Path to per-frame world target position CSV output.",
     )
     parser.add_argument(
         "--debug-ts-start",

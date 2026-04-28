@@ -44,11 +44,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override IE/GT txt path. Defaults to lidar config ie_pose.path.",
     )
-    parser.add_argument("--skip-existing", action="store_true", help="Skip bags with existing target_world_positions.jsonl.")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip bags with existing target_world_positions.csv output.")
     parser.add_argument("--continue-on-error", action="store_true", help="Continue processing later bags after a failure.")
     parser.add_argument("--parallel", type=int, default=1, metavar="N", help="Number of bags to process in parallel (default: 1).")
     parser.add_argument("--export-kml", action="store_true", help="Export per-bag and merged KML after JSONL outputs are created.")
-    parser.add_argument("--kml-sample-step", type=int, default=500, help="Sample step passed to KML exporter.")
     return parser.parse_args()
 
 
@@ -146,29 +145,29 @@ def run_command(command: list[str], log_path: Path) -> int:
     return int(process.returncode)
 
 
-def merge_jsonl(inputs: list[tuple[str, Path]], output_path: Path) -> int:
-    records: list[dict[str, Any]] = []
-    for bag_name, path in inputs:
+def merge_csv(inputs: list[tuple[str, Path]], output_path: Path) -> int:
+    import csv
+    rows: list[dict[str, str]] = []
+    fieldnames: list[str] | None = None
+    for _bag_name, path in inputs:
         if not path.exists():
             continue
-        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(item, dict):
-                item.setdefault("source_bag", bag_name)
-                records.append(item)
+        with path.open(encoding="utf-8", errors="ignore") as f:
+            reader = csv.DictReader(f)
+            if fieldnames is None and reader.fieldnames:
+                fieldnames = list(reader.fieldnames)
+            for row in reader:
+                rows.append(row)
 
-    records.sort(key=lambda item: float(item.get("timestamp", 0.0)))
+    rows.sort(key=lambda r: float(r.get("utc_seconds", 0.0)))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as file:
-        for item in records:
-            file.write(json.dumps(item, ensure_ascii=False) + "\n")
-    return len(records)
+    if fieldnames is None:
+        fieldnames = ["utc_seconds"]
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
 
 
 def merge_fusion_json(inputs: list[tuple[str, Path]], output_path: Path) -> int:
@@ -193,16 +192,14 @@ def merge_fusion_json(inputs: list[tuple[str, Path]], output_path: Path) -> int:
     return len(records)
 
 
-def export_kml_func(input_jsonl: Path, output_kml: Path, gt_path: str | None, sample_step: int, log_path: Path) -> int:
+def export_kml_func(input_csv: Path, output_kml: Path, gt_path: str | None, log_path: Path) -> int:
     command = [
         sys.executable,
         "tools/export_target_trajectory_kml.py",
         "--input",
-        str(input_jsonl),
+        str(input_csv),
         "--output",
         str(output_kml),
-        "--sample-step",
-        str(sample_step),
     ]
     if gt_path:
         command.extend(["--gt-txt", gt_path])
@@ -216,18 +213,17 @@ def process_single_bag(
     lidar_config: dict[str, Any],
     ie_path: str | None,
     export_kml: bool,
-    kml_sample_step: int,
     gt_path: str | None,
     skip_existing: bool,
 ) -> dict[str, Any]:
     """Process a single bag file. Returns a manifest entry dict."""
     bag_name = bag_path.stem
-    target_world_jsonl = bag_out_dir / "target_world_positions.jsonl"
+    target_world_csv = bag_out_dir / "target_world_positions.csv"
     fusion_json = bag_out_dir / "fusion_tracking_log.json"
     status = "pending"
     returncode = None
 
-    if skip_existing and target_world_jsonl.exists():
+    if skip_existing and target_world_csv.exists():
         status = "skipped_existing"
     else:
         aruco_runtime_path, lidar_runtime_path = prepare_configs(bag_path, bag_out_dir, aruco_config, lidar_config)
@@ -241,7 +237,7 @@ def process_single_bag(
             "--output-json",
             str(fusion_json),
             "--output-target-world-json",
-            str(target_world_jsonl),
+            str(target_world_csv),
         ]
         if ie_path:
             command.extend(["--ie-path", str(ie_path)])
@@ -249,12 +245,11 @@ def process_single_bag(
         returncode = run_command(command, bag_out_dir / "run.log")
         status = "completed" if returncode == 0 else "failed"
 
-    if export_kml and target_world_jsonl.exists():
+    if export_kml and target_world_csv.exists():
         export_kml_func(
-            target_world_jsonl,
+            target_world_csv,
             bag_out_dir / "target_trajectory.kml",
             gt_path,
-            kml_sample_step,
             bag_out_dir / "kml_export.log",
         )
 
@@ -264,7 +259,7 @@ def process_single_bag(
         "status": status,
         "returncode": returncode,
         "output_dir": str(bag_out_dir),
-        "target_world_jsonl": str(target_world_jsonl),
+        "target_world_csv": str(target_world_csv),
         "fusion_json": str(fusion_json),
         "run_log": str(bag_out_dir / "run.log"),
         "kml": str(bag_out_dir / "target_trajectory.kml") if export_kml else None,
@@ -284,9 +279,6 @@ def run_one_jobset(
     continue_on_error: bool,
     parallel: int,
     export_kml: bool,
-    kml_sample_step: int,
-    no_auto_calibrate_target_offsets: bool,
-    auto_offset_scan_frames_per_bag: int,
 ) -> dict[str, Any]:
     bags = sorted(bag_dir.glob(pattern), key=bag_sort_key)
     if not bags:
@@ -299,18 +291,7 @@ def run_one_jobset(
     if gt_path is None and isinstance(ie_cfg, dict):
         gt_path = str(ie_cfg.get("path", ""))
 
-    calibrated_offsets: dict[int, list[float]] = {}
-    if not no_auto_calibrate_target_offsets:
-        print(f"[{job_name}] auto-calibrating ArUco target offsets from bag folder...")
-        calibrated_offsets = auto_calibrate_target_offsets(
-            bags,
-            aruco_config,
-            frames_per_bag=int(auto_offset_scan_frames_per_bag),
-        )
-        apply_calibrated_offsets(aruco_config, calibrated_offsets)
-        print(f"[{job_name}] calibrated_offsets={{{', '.join(f'{k}: {v}' for k, v in sorted(calibrated_offsets.items()))}}}")
-
-    per_bag_jsonl: list[tuple[str, Path]] = []
+    per_bag_csv: list[tuple[str, Path]] = []
     per_bag_fusion_json: list[tuple[str, Path]] = []
     manifest: list[dict[str, Any]] = []
     failures: list[tuple[str, int]] = []
@@ -319,9 +300,9 @@ def run_one_jobset(
     for bag_path in bags:
         bag_name = bag_path.stem
         bag_out_dir = output_dir / "bags" / bag_name
-        target_world_jsonl = bag_out_dir / "target_world_positions.jsonl"
+        target_world_csv = bag_out_dir / "target_world_positions.csv"
         fusion_json = bag_out_dir / "fusion_tracking_log.json"
-        per_bag_jsonl.append((bag_path.name, target_world_jsonl))
+        per_bag_csv.append((bag_path.name, target_world_csv))
         per_bag_fusion_json.append((bag_path.name, fusion_json))
         jobs.append({
             "bag_path": bag_path,
@@ -330,7 +311,6 @@ def run_one_jobset(
             "lidar_config": lidar_config,
             "ie_path": ie_path_override,
             "export_kml": export_kml,
-            "kml_sample_step": kml_sample_step,
             "gt_path": gt_path,
             "skip_existing": skip_existing,
         })
@@ -366,7 +346,7 @@ def run_one_jobset(
                         "status": "failed",
                         "returncode": -1,
                         "output_dir": str(jobs[index]["bag_out_dir"]),
-                        "target_world_jsonl": str(jobs[index]["bag_out_dir"] / "target_world_positions.jsonl"),
+                        "target_world_csv": str(jobs[index]["bag_out_dir"] / "target_world_positions.csv"),
                         "fusion_json": str(jobs[index]["bag_out_dir"] / "fusion_tracking_log.json"),
                         "run_log": str(jobs[index]["bag_out_dir"] / "run.log"),
                         "kml": None,
@@ -389,20 +369,19 @@ def run_one_jobset(
                 manifest.append(results_by_bag[bag_key])
 
     merged_dir = output_dir / "merged"
-    merged_jsonl = merged_dir / "target_world_positions.jsonl"
-    merged_count = merge_jsonl(per_bag_jsonl, merged_jsonl)
+    merged_csv = merged_dir / "target_world_positions.csv"
+    merged_count = merge_csv(per_bag_csv, merged_csv)
     merged_fusion_count = merge_fusion_json(per_bag_fusion_json, merged_dir / "fusion_tracking_log.json")
 
-    print(f"[{job_name}] merged target jsonl: {merged_jsonl} records={merged_count}")
+    print(f"[{job_name}] merged target csv: {merged_csv} records={merged_count}")
     if merged_fusion_count:
         print(f"[{job_name}] merged fusion json: {merged_dir / 'fusion_tracking_log.json'} records={merged_fusion_count}")
 
     if export_kml and merged_count > 0:
         kml_code = export_kml_func(
-            merged_jsonl,
+            merged_csv,
             merged_dir / "target_trajectory.kml",
             gt_path,
-            kml_sample_step,
             merged_dir / "kml_export.log",
         )
         if kml_code == 0:
@@ -418,10 +397,9 @@ def run_one_jobset(
                 "job_name": job_name,
                 "bag_dir": str(bag_dir),
                 "bag_count": len(bags),
-                "merged_target_world_jsonl": str(merged_jsonl),
+                "merged_target_world_csv": str(merged_csv),
                 "merged_fusion_json": str(merged_dir / "fusion_tracking_log.json"),
                 "merged_kml": str(merged_dir / "target_trajectory.kml") if export_kml else None,
-                "calibrated_target_offsets_m": {str(k): v for k, v in sorted(calibrated_offsets.items())},
                 "bags": manifest,
             },
             ensure_ascii=False,
@@ -501,13 +479,6 @@ def main() -> None:
                 continue_on_error=bool(_value_from_job_defaults_cli(raw_job, defaults, args, "continue_on_error")),
                 parallel=int(_value_from_job_defaults_cli(raw_job, defaults, args, "parallel")),
                 export_kml=bool(_value_from_job_defaults_cli(raw_job, defaults, args, "export_kml")),
-                kml_sample_step=int(_value_from_job_defaults_cli(raw_job, defaults, args, "kml_sample_step")),
-                no_auto_calibrate_target_offsets=bool(
-                    _value_from_job_defaults_cli(raw_job, defaults, args, "no_auto_calibrate_target_offsets")
-                ),
-                auto_offset_scan_frames_per_bag=int(
-                    _value_from_job_defaults_cli(raw_job, defaults, args, "auto_offset_scan_frames_per_bag")
-                ),
             )
             summary.append(result)
             if result["failed_bags"]:
@@ -540,9 +511,6 @@ def main() -> None:
         continue_on_error=args.continue_on_error,
         parallel=args.parallel,
         export_kml=args.export_kml,
-        kml_sample_step=args.kml_sample_step,
-        no_auto_calibrate_target_offsets=args.no_auto_calibrate_target_offsets,
-        auto_offset_scan_frames_per_bag=args.auto_offset_scan_frames_per_bag,
     )
     if result["failed_bags"]:
         raise SystemExit(1)
