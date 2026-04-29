@@ -270,6 +270,11 @@ def write_kml(
       <name>Targets</name>
 {''.join(target_parts)}
     </Folder>
+    <Schema name="gt_schema" id="gt_schema">
+      <gx:SimpleArrayField name="utc_seconds" type="xsd:string">
+        <displayName>UTC Seconds</displayName>
+      </gx:SimpleArrayField>
+    </Schema>
     <Folder>
       <name>GT_Full_Curve</name>
       <description><![CDATA[{desc_for_track(gt_points)}]]></description>
@@ -277,16 +282,10 @@ def write_kml(
         <name>gt_full_track</name>
         <styleUrl>#gtLine</styleUrl>
         <description><![CDATA[{desc_for_track(gt_points)}]]></description>
-        <LineString>
-          <tessellate>1</tessellate>
-          <altitudeMode>{altitude_mode}</altitudeMode>
-          <coordinates>
-{coords(gt_points)}
-          </coordinates>
-        </LineString>
+{gx_track(gt_points, altitude_mode, "gt_schema")}
       </Placemark>
-{point_placemark("gt_start", gt_points[0], altitude_mode, "#startPoint")}
-{point_placemark("gt_end", gt_points[-1], altitude_mode, "#endPoint")}
+{point_placemark("gt_start", gt_points[0], altitude_mode, "#startPoint", show_timestamp=True)}
+{point_placemark("gt_end", gt_points[-1], altitude_mode, "#endPoint", show_timestamp=True)}
     </Folder>
   </Document>
 </kml>
